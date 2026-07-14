@@ -1,1 +1,3 @@
-teste
+streamlit
+pandas
+selenium
