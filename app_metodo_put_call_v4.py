@@ -1,4 +1,6 @@
+import re
 import time
+import unicodedata
 from datetime import date, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -8,21 +10,11 @@ import streamlit as st
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-
 
 
 st.set_page_config(page_title="Método PUT + CALL", layout="wide")
 
 ARQUIVO_OPERACOES = Path("operacoes_abertas.csv")
-
-COLUNAS = {
-    0: "codigo", 1: "check", 2: "estilo", 3: "strike",
-    4: "situacao", 5: "distancia_pct", 6: "ultimo", 7: "variacao_pct",
-    8: "data_ultimo_negocio", 9: "negocios", 10: "volume",
-    11: "volatilidade", 12: "delta", 13: "gamma", 14: "theta",
-    15: "theta_pct", 16: "vega", 17: "iq",
-}
 
 MESES = {
     "A": "Jan", "B": "Fev", "C": "Mar", "D": "Abr", "E": "Mai", "F": "Jun",
@@ -41,272 +33,282 @@ VENCIMENTOS_OPCOESNET = {
     "Dez - 18/12": "18/12",
 }
 
+COLUNAS_MERCADO = [
+    "ativo", "codigo", "tipo", "fm", "estilo", "strike", "situacao",
+    "distancia_pct", "ultimo", "variacao_pct", "data_ultimo_negocio",
+    "negocios", "volume", "volatilidade", "delta", "gamma", "theta",
+    "theta_pct", "vega", "iq", "coberto", "travado", "descoberto",
+    "titulares", "lancadores",
+]
+
 COLUNAS_OPERACOES = [
     "id", "data_abertura", "ativo_base", "codigo", "tipo", "strike",
     "premio_recebido", "quantidade", "vencimento", "cotacao_atual_manual",
-    "status", "observacao"
+    "status", "observacao",
 ]
 
 
-def moeda_para_float(x):
+# ----------------------------- CONVERSÕES -----------------------------
+def normalizar_texto(texto):
+    texto = unicodedata.normalize("NFKD", str(texto or ""))
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    texto = texto.lower().replace("\n", " ")
+    return re.sub(r"\s+", " ", texto).strip()
+
+
+def moeda_para_float(valor):
     try:
-        texto = str(x).strip()
-        if texto == "" or texto.lower() == "nan":
+        texto = str(valor).strip()
+        if texto == "" or texto.lower() in {"nan", "none", "-"}:
             return 0.0
-        return float(
+        texto = (
             texto.replace("R$", "")
-            .replace(".", "")
-            .replace(",", ".")
+            .replace(" ", "")
             .replace("+", "")
             .replace("−", "-")
             .replace("%", "")
-            .strip()
         )
+        # Formato brasileiro: 18.716,00 -> 18716.00
+        if "," in texto:
+            texto = texto.replace(".", "").replace(",", ".")
+        return float(texto)
     except (TypeError, ValueError):
         return 0.0
 
 
-def fmt_rs(x):
+def fmt_rs(valor):
     try:
-        return f"R$ {float(x):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        return f"R$ {float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except (TypeError, ValueError):
         return "R$ 0,00"
 
 
-def fmt_pct(x):
+def fmt_pct(valor, casas=1):
     try:
-        return f"{float(x):.1f}%".replace(".", ",")
+        return f"{float(valor):.{casas}f}%".replace(".", ",")
     except (TypeError, ValueError):
         return "0,0%"
 
 
 def mes_opcao(codigo):
     try:
-        letra = str(codigo).strip().upper()[4]
-        return MESES.get(letra, "Indef.")
+        return MESES.get(str(codigo).strip().upper()[4], "Indef.")
     except (IndexError, TypeError):
         return "Indef."
 
 
+def codigo_parece_opcao(codigo, ativo):
+    codigo = str(codigo or "").strip().upper()
+    raiz = re.sub(r"\d+$", "", str(ativo).upper())
+    return bool(re.fullmatch(rf"{re.escape(raiz)}[A-X]\d+", codigo))
+
+
+# ----------------------------- SELENIUM -----------------------------
 def criar_driver():
     options = Options()
-
-    options.binary_location = "/usr/bin/chromium"
-
     options.add_argument("--headless=new")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
     options.add_argument("--disable-extensions")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--remote-debugging-pipe")
+    options.add_argument("--blink-settings=imagesEnabled=false")
+    return webdriver.Chrome(options=options)
 
-    service = Service(
-        executable_path="/usr/bin/chromedriver"
-    )
 
-    return webdriver.Chrome(
-        service=service,
-        options=options
-    )
-
-def extrair_tabela_visivel(driver, ativo, tipo):
-    """
-    Extrai a grade atual do Opções.Net.Br.
-
-    A página atual não traz uma coluna de tipo dentro da tabela;
-    CALL/PUT é definido pelo seletor acima da grade. Por isso o
-    tipo é recebido como argumento e gravado em todas as linhas.
-    """
-
-    linhas = []
-
-    for tabela in driver.find_elements(By.TAG_NAME, "table"):
-
+def aceitar_dados_fechamento(driver):
+    textos = ["Continuar com dados de fechamento", "Continuar", "Aceitar", "OK"]
+    for texto in textos:
         try:
-            if not tabela.is_displayed():
-                continue
+            elementos = driver.find_elements(
+                By.XPATH, f"//*[contains(normalize-space(text()), '{texto}')]"
+            )
+            for elemento in elementos:
+                if elemento.is_displayed() and elemento.is_enabled():
+                    driver.execute_script("arguments[0].click();", elemento)
+                    time.sleep(1)
+                    return True
         except Exception:
             continue
-
-        for row in tabela.find_elements(By.TAG_NAME, "tr"):
-
-            cols = row.find_elements(By.TAG_NAME, "td")
-            dados = [c.text.strip() for c in cols]
-
-            if dados:
-                print("=" * 80)
-                print(f"DEBUG {ativo}")
-                print(f"Quantidade de colunas: {len(dados)}")
-                print(dados)
-
-                linhas.append(dados)
-
-    colunas_finais = [
-        "ativo",
-        "codigo",
-        "tipo",
-        "estilo",
-        "strike",
-        "situacao",
-        "distancia_pct",
-        "ultimo",
-        "variacao_pct",
-        "data_ultimo_negocio",
-        "negocios",
-        "volume",
-        "volatilidade",
-        "delta",
-        "gamma",
-        "theta",
-        "vega",
-        "lambda",
-    ]
-
-    if not linhas:
-        return pd.DataFrame(columns=colunas_finais)
-
-    # Descobre automaticamente a maior linha encontrada
-    largura = max(len(x) for x in linhas)
-
-    # Completa as menores
-    linhas = [x + [""] * (largura - len(x)) for x in linhas]
-
-    df = pd.DataFrame(linhas)
-
-    # Renomeia somente as colunas conhecidas
-    for i, nome in COLUNAS.items():
-        if i < len(df.columns):
-            df.rename(columns={i: nome}, inplace=True)
-
-    # Garante que existam todas as colunas
-    for c in colunas_finais:
-        if c not in df.columns:
-            df[c] = ""
-
-    df["ativo"] = ativo
-    df["tipo"] = tipo
-
-    return df[colunas_finais]
-
-def selecionar_tipo(driver, tipo):
-    alvo = "CALLs" if tipo == "CALL" else "PUTs"
-
-    # Primeiro tenta clicar no label que contém o radio.
-    try:
-        for label in driver.find_elements(By.XPATH, "//label"):
-            if alvo.lower() in label.text.strip().lower():
-                try:
-                    radio = label.find_element(By.XPATH, ".//input[@type='radio']")
-                    if not radio.is_selected():
-                        driver.execute_script("arguments[0].click();", radio)
-                    time.sleep(2)
-                    return True
-                except Exception:
-                    driver.execute_script("arguments[0].click();", label)
-                    time.sleep(2)
-                    return True
-    except Exception:
-        pass
-
-    # Fallback: procura qualquer elemento visível com o texto.
-    try:
-        elementos = driver.find_elements(
-            By.XPATH,
-            f"//*[translate(normalize-space(text()), 'abcdefghijklmnopqrstuvwxyz', "
-            f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ')='{alvo.upper()}']"
-        )
-        for el in elementos:
-            try:
-                if el.is_displayed():
-                    driver.execute_script("arguments[0].click();", el)
-                    time.sleep(2)
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
-
     return False
+
+
+def localizar_checkbox_vencimento(driver, vencimento_texto):
+    """Localiza o checkbox imediatamente ligado ao texto do vencimento."""
+    elementos = driver.find_elements(
+        By.XPATH,
+        f"//*[contains(normalize-space(text()), '{vencimento_texto}')]",
+    )
+    for elemento in elementos:
+        try:
+            if not elemento.is_displayed():
+                continue
+
+            candidatos_xpath = [
+                ".//input[@type='checkbox']",
+                "./preceding-sibling::input[@type='checkbox'][1]",
+                "./preceding::input[@type='checkbox'][1]",
+                "./ancestor::label[1]//input[@type='checkbox']",
+                "./parent::*//input[@type='checkbox']",
+            ]
+            for xpath in candidatos_xpath:
+                try:
+                    checkbox = elemento.find_element(By.XPATH, xpath)
+                    if checkbox.is_displayed():
+                        return checkbox
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return None
 
 
 def selecionar_vencimento(driver, vencimento_texto):
     if vencimento_texto is None:
         return True
 
-    try:
-        time.sleep(3)
+    time.sleep(1)
+    checkbox_alvo = localizar_checkbox_vencimento(driver, vencimento_texto)
+    if checkbox_alvo is None:
+        return False
 
-        # Procura o elemento de texto mais específico do vencimento
-        textos = driver.find_elements(
-            By.XPATH,
-            f"//*[contains(normalize-space(text()), '{vencimento_texto}')]"
-        )
-
-        for texto in textos:
-            try:
-                if not texto.is_displayed():
-                    continue
-
-                # Procura o checkbox imediatamente anterior ao texto
-                checkbox = texto.find_element(
-                    By.XPATH,
-                    "./preceding::input[@type='checkbox'][1]"
-                )
-
-                driver.execute_script(
-                    "arguments[0].scrollIntoView({block: 'center'});",
-                    checkbox
-                )
-
-                if not checkbox.is_selected():
-                    driver.execute_script(
-                        "arguments[0].click();",
-                        checkbox
-                    )
-
-                time.sleep(5)
-                return checkbox.is_selected()
-
-            except Exception:
-                continue
-
-    except Exception as e:
-        print(f"Erro ao selecionar {vencimento_texto}: {e}")
-
-    return False
-
-def aceitar_dados_fechamento(driver):
-    textos = [
-        "Continuar com dados de fechamento",
-        "Continuar",
-        "Aceitar",
-        "OK",
-    ]
-
-    for texto in textos:
+    # Desmarca os demais vencimentos visíveis para a grade trazer só o solicitado.
+    for checkbox in driver.find_elements(By.XPATH, "//input[@type='checkbox']"):
         try:
-            elementos = driver.find_elements(
-                By.XPATH,
-                f"//*[contains(normalize-space(text()), '{texto}')]"
+            if checkbox == checkbox_alvo or not checkbox.is_displayed():
+                continue
+            if checkbox.is_selected():
+                driver.execute_script("arguments[0].click();", checkbox)
+                time.sleep(0.3)
+        except Exception:
+            continue
+
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});", checkbox_alvo
+        )
+        if not checkbox_alvo.is_selected():
+            driver.execute_script("arguments[0].click();", checkbox_alvo)
+        time.sleep(3)
+        return checkbox_alvo.is_selected()
+    except Exception:
+        return False
+
+
+def nome_canonico_cabecalho(cabecalho):
+    texto = normalizar_texto(cabecalho)
+
+    # A ordem importa: termos mais específicos primeiro.
+    regras = [
+        ("dist", "distancia_pct"),
+        ("vol. financeiro", "volume"),
+        ("vol financeiro", "volume"),
+        ("vol. impl", "volatilidade"),
+        ("vol impl", "volatilidade"),
+        ("num. de neg", "negocios"),
+        ("num de neg", "negocios"),
+        ("n. neg", "negocios"),
+        ("data/hora", "data_ultimo_negocio"),
+        ("dt / hr", "data_ultimo_negocio"),
+        ("theta (%)", "theta_pct"),
+        ("theta ($)", "theta"),
+        ("ticker", "codigo"),
+        ("opcao", "codigo"),
+        ("tipo", "tipo"),
+        ("f.m", "fm"),
+        ("mod", "estilo"),
+        ("strike", "strike"),
+        ("a/i/otm", "situacao"),
+        ("ai/otm", "situacao"),
+        ("ultimo", "ultimo"),
+        ("var", "variacao_pct"),
+        ("delta", "delta"),
+        ("gamma", "gamma"),
+        ("theta", "theta"),
+        ("vega", "vega"),
+        ("iq", "iq"),
+        ("coberto", "coberto"),
+        ("travado", "travado"),
+        ("descob", "descoberto"),
+        ("tit", "titulares"),
+        ("lan", "lancadores"),
+    ]
+    for termo, nome in regras:
+        if termo in texto:
+            return nome
+    return None
+
+
+def extrair_tabela_visivel(driver, ativo):
+    """Extrai a tabela rica da página usando os cabeçalhos reais do site."""
+    melhor_tabela = None
+    melhor_cabecalhos = []
+
+    for tabela in driver.find_elements(By.TAG_NAME, "table"):
+        try:
+            if not tabela.is_displayed():
+                continue
+            headers = [
+                h.text.strip()
+                for h in tabela.find_elements(By.XPATH, ".//thead//th | .//tr[1]/th")
+            ]
+            normalizados = [normalizar_texto(h) for h in headers]
+            pontos = sum(
+                any(chave in h for h in normalizados)
+                for chave in ["ticker", "strike", "delta", "ultimo"]
             )
+            if pontos >= 2 and len(headers) > len(melhor_cabecalhos):
+                melhor_tabela = tabela
+                melhor_cabecalhos = headers
+        except Exception:
+            continue
 
-            for elemento in elementos:
-                try:
-                    if elemento.is_displayed() and elemento.is_enabled():
-                        driver.execute_script(
-                            "arguments[0].click();",
-                            elemento
-                        )
-                        time.sleep(2)
-                        return True
-                except:
-                    pass
+    if melhor_tabela is None:
+        return pd.DataFrame(columns=COLUNAS_MERCADO)
 
-        except:
-            pass
+    mapa_indices = {}
+    for indice, cabecalho in enumerate(melhor_cabecalhos):
+        nome = nome_canonico_cabecalho(cabecalho)
+        if nome and nome not in mapa_indices.values():
+            mapa_indices[indice] = nome
 
-    return False
+    linhas = []
+    for row in melhor_tabela.find_elements(By.XPATH, ".//tbody/tr | .//tr"):
+        celulas = row.find_elements(By.TAG_NAME, "td")
+        if not celulas:
+            continue
+        dados = [c.text.strip() for c in celulas]
+
+        registro = {col: "" for col in COLUNAS_MERCADO}
+        registro["ativo"] = ativo
+        for indice, nome in mapa_indices.items():
+            if indice < len(dados):
+                registro[nome] = dados[indice]
+
+        # Fallback para a estrutura exibida na captura atual do site.
+        if not registro["codigo"] and len(dados) >= 18:
+            fallback = {
+                0: "codigo", 1: "tipo", 2: "fm", 3: "estilo", 4: "strike",
+                5: "situacao", 6: "distancia_pct", 7: "ultimo",
+                8: "variacao_pct", 9: "data_ultimo_negocio", 10: "negocios",
+                11: "volume", 12: "volatilidade", 13: "delta", 14: "gamma",
+                15: "theta", 16: "theta_pct", 17: "vega", 18: "iq",
+                19: "coberto", 20: "travado", 21: "descoberto",
+                22: "titulares", 23: "lancadores",
+            }
+            for indice, nome in fallback.items():
+                if indice < len(dados):
+                    registro[nome] = dados[indice]
+
+        if codigo_parece_opcao(registro["codigo"], ativo):
+            linhas.append(registro)
+
+    if not linhas:
+        return pd.DataFrame(columns=COLUNAS_MERCADO)
+
+    return pd.DataFrame(linhas, columns=COLUNAS_MERCADO).drop_duplicates(
+        subset=["ativo", "codigo", "tipo"], keep="first"
+    )
 
 
 def coletar_opcoes(ativo, vencimento_escolhido):
@@ -315,64 +317,94 @@ def coletar_opcoes(ativo, vencimento_escolhido):
     try:
         driver = criar_driver()
         driver.get(url)
-        time.sleep(7)
+        time.sleep(5)
         aceitar_dados_fechamento(driver)
 
         vencimento_texto = VENCIMENTOS_OPCOESNET.get(vencimento_escolhido)
         if vencimento_texto and not selecionar_vencimento(driver, vencimento_texto):
-            return pd.DataFrame()
+            raise RuntimeError(f"não consegui selecionar o vencimento {vencimento_texto}")
 
-        partes = []
-        for tipo in ["CALL", "PUT"]:
-            if selecionar_tipo(driver, tipo):
-                parte = extrair_tabela_visivel(driver, ativo, tipo)
-                if not parte.empty:
-                    partes.append(parte)
-
-        if not partes:
-            return pd.DataFrame()
-
-        return pd.concat(partes, ignore_index=True).drop_duplicates(
-            subset=["ativo", "codigo", "tipo"], keep="first"
-        )
+        return extrair_tabela_visivel(driver, ativo)
     finally:
         if driver is not None:
             driver.quit()
 
 
+# ----------------------------- ANÁLISE -----------------------------
+def classificar_exercicio(delta):
+    prob = min(abs(float(delta)) * 100, 100)
+    if prob < 15:
+        return prob, "Muito baixa", "🟢"
+    if prob < 30:
+        return prob, "Baixa", "🟢"
+    if prob < 50:
+        return prob, "Moderada", "🟡"
+    if prob < 70:
+        return prob, "Alta", "🟠"
+    return prob, "Muito alta", "🔴"
+
+
 def preparar(df):
     df = df.copy()
-    for col in [
-        "strike", "distancia_pct", "ultimo", "variacao_pct", "negocios", "volume",
-        "volatilidade", "delta", "gamma", "theta", "vega", "lambda"
-    ]:
+    numericas = [
+        "strike", "distancia_pct", "ultimo", "variacao_pct", "negocios",
+        "volume", "volatilidade", "delta", "gamma", "theta", "theta_pct",
+        "vega", "iq", "coberto", "travado", "descoberto", "titulares",
+        "lancadores",
+    ]
+    for col in numericas:
+        if col not in df.columns:
+            df[col] = 0.0
         df[col] = df[col].apply(moeda_para_float)
 
     df["codigo"] = df["codigo"].astype(str).str.upper().str.strip()
     df["tipo"] = df["tipo"].astype(str).str.upper().str.strip()
+    df = df[df["tipo"].isin(["CALL", "PUT"])]
     df["mes"] = df["codigo"].apply(mes_opcao)
+
     df["premio_total"] = df["ultimo"] * 100
     df["preco_efetivo_put"] = df["strike"] - df["ultimo"]
     df["venda_efetiva_call"] = df["strike"] + df["ultimo"]
     df["cotacao_atual"] = df.apply(
         lambda row: row["strike"] / (1 + row["distancia_pct"] / 100)
-        if row["distancia_pct"] != -100 else 0,
-        axis=1
+        if row["strike"] > 0 and abs(1 + row["distancia_pct"] / 100) > 0.0001
+        else 0,
+        axis=1,
     )
-    df["score_premio"] = df["premio_total"].apply(
-        lambda x: 4 if x >= 80 else 3 if x >= 40 else 2 if x >= 15 else 1
+
+    # Score de oportunidade: prêmio, liquidez e distância. O Delta é mostrado
+    # separadamente como risco aproximado de terminar no dinheiro.
+    df["retorno_premio_pct"] = df.apply(
+        lambda r: (r["ultimo"] / r["strike"] * 100) if r["strike"] > 0 else 0,
+        axis=1,
     )
-    df["score_liquidez"] = df["negocios"].apply(
-        lambda x: 4 if x >= 20 else 3 if x >= 5 else 2 if x >= 1 else 1
+    df["score_premio"] = df["retorno_premio_pct"].apply(
+        lambda x: 4 if x >= 2 else 3 if x >= 1 else 2 if x >= 0.5 else 1
     )
-    df["score_distancia"] = abs(df["distancia_pct"]).apply(
-        lambda x: 4 if x >= 3 else 3 if x >= 1.5 else 2 if x >= 0.5 else 1
+    df["score_liquidez"] = df.apply(
+        lambda r: 4 if r["negocios"] >= 20 or r["volume"] >= 50000
+        else 3 if r["negocios"] >= 5 or r["volume"] >= 10000
+        else 2 if r["negocios"] >= 1 or r["volume"] > 0
+        else 1,
+        axis=1,
     )
-    df["score_total"] = df["score_premio"] + df["score_liquidez"] + df["score_distancia"]
+    df["score_distancia"] = df["distancia_pct"].abs().apply(
+        lambda x: 4 if x >= 5 else 3 if x >= 3 else 2 if x >= 1 else 1
+    )
+    df["score_total"] = (
+        df["score_premio"] + df["score_liquidez"] + df["score_distancia"]
+    )
     df["diagnostico"] = df["score_total"].apply(
-        lambda x: "Muito boa" if x >= 10 else "Boa" if x >= 8 else "Regular" if x >= 6 else "Fraca"
+        lambda x: "Muito boa" if x >= 10 else "Boa" if x >= 8
+        else "Regular" if x >= 6 else "Fraca"
     )
-    return df
+
+    exercicio = df["delta"].apply(classificar_exercicio)
+    df["chance_exercicio_pct"] = exercicio.apply(lambda x: x[0])
+    df["chance_exercicio"] = exercicio.apply(lambda x: x[1])
+    df["chance_icone"] = exercicio.apply(lambda x: x[2])
+
+    return df.sort_values(["ativo", "tipo", "score_total"], ascending=[True, True, False])
 
 
 def badge_diag(diag):
@@ -385,7 +417,7 @@ def card_diagnostico(op, tipo):
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Ativo", op["ativo"])
     c2.metric("Código", op["codigo"])
-    c3.metric("Cotação atual", fmt_rs(op["cotacao_atual"]))
+    c3.metric("Cotação da ação", fmt_rs(op["cotacao_atual"]))
     c4.metric("Strike", fmt_rs(op["strike"]))
     c5.metric("Prêmio por lote", fmt_rs(op["premio_total"]))
 
@@ -394,24 +426,44 @@ def card_diagnostico(op, tipo):
         c6.metric("Preço efetivo", fmt_rs(op["preco_efetivo_put"]))
     else:
         c6.metric("Venda efetiva", fmt_rs(op["venda_efetiva_call"]))
-    c7.metric("Situação", op["situacao"])
+    c7.metric("Situação", op["situacao"] or "—")
     c8.metric("Delta", f"{op['delta']:.3f}".replace(".", ","))
-    c9.metric("Negócios", int(op["negocios"]))
-    c10.metric("Diagnóstico", op["diagnostico"])
+    c9.metric("Vol. implícita", fmt_pct(op["volatilidade"]))
+    c10.metric("Negócios", int(op["negocios"]))
 
-    texto = (
-        f"{tipo} {badge_diag(op['diagnostico'])}. Prêmio de {fmt_rs(op['premio_total'])} por lote. "
-        + (f"Compra efetiva aproximada em {fmt_rs(op['preco_efetivo_put'])}."
-           if tipo == "PUT" else
-           f"Venda efetiva aproximada em {fmt_rs(op['venda_efetiva_call'])}.")
+    st.markdown(
+        f"**Chance aproximada de terminar no dinheiro:** "
+        f"{op['chance_icone']} **{op['chance_exercicio']}** "
+        f"({fmt_pct(op['chance_exercicio_pct'], 0)} pelo módulo do Delta)."
     )
-    (st.success if tipo == "PUT" else st.info)(texto)
+    st.caption(
+        "O Delta é uma aproximação, não uma garantia de exercício. O exercício efetivo "
+        "depende do preço no vencimento e das regras da opção."
+    )
+
+    fatores = []
+    if abs(op["distancia_pct"]) >= 3:
+        fatores.append(f"strike a {fmt_pct(abs(op['distancia_pct']))} do preço da ação")
+    else:
+        fatores.append("strike próximo do preço da ação")
+    if op["negocios"] >= 5:
+        fatores.append("liquidez razoável na sessão")
+    else:
+        fatores.append("poucos negócios; atenção ao preço executável")
+    if op["volatilidade"] >= 35:
+        fatores.append("volatilidade implícita elevada")
+    elif op["volatilidade"] > 0:
+        fatores.append("volatilidade implícita moderada")
+
+    st.info(
+        f"**Qualidade da oportunidade:** {badge_diag(op['diagnostico'])}. "
+        + "; ".join(fatores)
+        + "."
+    )
 
 
-
-
+# ----------------------------- OPERAÇÕES ABERTAS -----------------------------
 def render_velocimetro(percentual):
-    """Velocímetro semicircular em HTML/CSS, sem dependências extras."""
     pct = max(0.0, min(float(percentual), 100.0))
     angulo = pct * 1.8
     if pct >= 80:
@@ -429,8 +481,7 @@ def render_velocimetro(percentual):
         <div style="display:flex;flex-direction:column;align-items:center;margin:4px 0 12px 0;">
           <div style="position:relative;width:230px;height:115px;overflow:hidden;">
             <div style="position:absolute;width:230px;height:230px;border-radius:50%;
-                        background:conic-gradient(from 270deg, {cor} 0deg {angulo}deg, #e9edf3 {angulo}deg 180deg, transparent 180deg 360deg);">
-            </div>
+                        background:conic-gradient(from 270deg, {cor} 0deg {angulo}deg, #e9edf3 {angulo}deg 180deg, transparent 180deg 360deg);"></div>
             <div style="position:absolute;left:25px;top:25px;width:180px;height:180px;border-radius:50%;background:white;"></div>
             <div style="position:absolute;left:112px;bottom:0;width:6px;height:88px;background:#343a40;
                         transform-origin:bottom center;transform:rotate({-90 + angulo}deg);border-radius:4px;"></div>
@@ -451,7 +502,10 @@ def carregar_operacoes():
         df = pd.read_csv(ARQUIVO_OPERACOES, dtype={"codigo": str, "ativo_base": str})
         for col in COLUNAS_OPERACOES:
             if col not in df.columns:
-                df[col] = "" if col in ["id", "data_abertura", "ativo_base", "codigo", "tipo", "vencimento", "status", "observacao"] else 0.0
+                df[col] = "" if col in {
+                    "id", "data_abertura", "ativo_base", "codigo", "tipo",
+                    "vencimento", "status", "observacao",
+                } else 0.0
         return df[COLUNAS_OPERACOES]
     except Exception:
         return pd.DataFrame(columns=COLUNAS_OPERACOES)
@@ -476,8 +530,7 @@ def enriquecer_operacoes(df):
         return df.copy()
 
     resultado = df.copy()
-    numericas = ["strike", "premio_recebido", "quantidade", "cotacao_atual_manual"]
-    for col in numericas:
+    for col in ["strike", "premio_recebido", "quantidade", "cotacao_atual_manual"]:
         resultado[col] = pd.to_numeric(resultado[col], errors="coerce").fillna(0)
 
     def preco_atual(row):
@@ -490,21 +543,23 @@ def enriquecer_operacoes(df):
     resultado["resultado_atual"] = resultado["valor_recebido"] - resultado["custo_encerramento"]
     resultado["capital_referencia"] = resultado["strike"] * resultado["quantidade"]
     resultado["rentabilidade_atual_pct"] = resultado.apply(
-        lambda r: (r["resultado_atual"] / r["capital_referencia"] * 100)
+        lambda r: r["resultado_atual"] / r["capital_referencia"] * 100
         if r["capital_referencia"] > 0 else 0,
-        axis=1
+        axis=1,
     )
     resultado["rentabilidade_maxima_pct"] = resultado.apply(
-        lambda r: (r["valor_recebido"] / r["capital_referencia"] * 100)
+        lambda r: r["valor_recebido"] / r["capital_referencia"] * 100
         if r["capital_referencia"] > 0 else 0,
-        axis=1
+        axis=1,
     )
     resultado["premio_capturado_pct"] = resultado.apply(
-        lambda r: (r["resultado_atual"] / r["valor_recebido"] * 100) if r["valor_recebido"] > 0 else 0,
-        axis=1
+        lambda r: r["resultado_atual"] / r["valor_recebido"] * 100
+        if r["valor_recebido"] > 0 else 0,
+        axis=1,
     )
 
     hoje = date.today()
+
     def dias_restantes(valor):
         try:
             return (datetime.strptime(str(valor)[:10], "%Y-%m-%d").date() - hoje).days
@@ -517,15 +572,15 @@ def enriquecer_operacoes(df):
         pct = row["premio_capturado_pct"]
         dias = row["dias_restantes"]
         if row["cotacao_atual"] <= 0:
-            return "⚪ Informe/atualize a cotação"
+            return "⚪ Informe ou atualize a cotação"
         if pct >= 90:
-            return "🟢 Avaliar encerramento: ≥ 90% capturado"
+            return "🟢 Avaliar encerramento: 90% ou mais capturado"
         if pct >= 80:
-            return "🟢 Pode valer encerrar: ≥ 80% capturado"
+            return "🟢 Pode valer encerrar: 80% ou mais capturado"
         if pct >= 60 and dias <= 7:
-            return "🟡 Avaliar risco x prêmio restante"
+            return "🟡 Avaliar risco versus prêmio restante"
         if pct < 0:
-            return "🔴 Posição em prejuízo: revisar risco"
+            return "🔴 Posição em prejuízo: revisar o risco"
         return "🟡 Manter e acompanhar"
 
     resultado["sinal"] = resultado.apply(diagnostico_saida, axis=1)
@@ -549,13 +604,11 @@ with aba_oportunidades:
         st.subheader("Resumo do dia")
         st.write(f"Empresas monitoradas: **{len(st.session_state.empresas)}**")
         nova = st.text_input("Adicionar empresa", placeholder="Ex.: CPFL3").upper().strip()
-        if nova and len(nova) < 5:
-            st.warning("Digite o ticker completo. Exemplo: BBAS3, não BBAS.")
         if st.button("Adicionar empresa"):
             if not nova:
                 st.warning("Digite uma empresa.")
             elif len(nova) < 5:
-                st.error("Ticker incompleto.")
+                st.error("Ticker incompleto. Exemplo: BBAS3.")
             elif nova in st.session_state.empresas:
                 st.warning("Essa empresa já está na lista.")
             elif len(st.session_state.empresas) >= 10:
@@ -577,14 +630,16 @@ with aba_oportunidades:
     st.subheader("Vencimento para buscar")
     vencimento_busca = st.radio(
         "Escolha o vencimento antes de atualizar o mercado:",
-        list(VENCIMENTOS_OPCOESNET.keys()), horizontal=True
+        list(VENCIMENTOS_OPCOESNET.keys()),
+        horizontal=True,
     )
-    st.caption("O app busca apenas o vencimento escolhido para reduzir o tempo e os travamentos.")
+    st.caption("O app busca somente o vencimento escolhido em cada empresa.")
 
     if st.button("🔄 Atualizar mercado", type="primary"):
         dfs = []
         progress = st.progress(0)
         status = st.empty()
+        erros = []
 
         for i, emp in enumerate(st.session_state.empresas):
             status.write(f"Coletando {emp} — vencimento: {vencimento_busca}...")
@@ -593,84 +648,118 @@ with aba_oportunidades:
                 if not df_emp.empty:
                     dfs.append(df_emp)
                 else:
-                    st.warning(f"Nenhuma opção encontrada para {emp}.")
-            except Exception as e:
-                st.warning(f"Erro em {emp}: {e}")
+                    erros.append(f"{emp}: a tabela não retornou opções.")
+            except Exception as exc:
+                erros.append(f"{emp}: {exc}")
             progress.progress((i + 1) / max(len(st.session_state.empresas), 1))
 
         status.empty()
         if dfs:
             dados = preparar(pd.concat(dfs, ignore_index=True))
-            meses_coletados = sorted(dados["mes"].dropna().unique().tolist())
-
             if vencimento_busca != "Vencimento atual":
                 mes_nome = vencimento_busca.split(" - ")[0]
-                if mes_nome not in meses_coletados:
-                    st.error(
-                        f"Não consegui acessar o vencimento '{vencimento_busca}'. "
-                        f"A coleta retornou: {', '.join(meses_coletados) or 'nenhum mês'}"
-                    )
-                dados = dados[dados["mes"] == mes_nome]
+                dados = dados[dados["mes"] == mes_nome].copy()
 
             st.session_state.dados = dados
             st.session_state.vencimento_carregado = vencimento_busca
-            st.success(f"Mercado atualizado para: {vencimento_busca}")
+            if dados.empty:
+                st.error(
+                    "A coleta encontrou linhas, mas nenhuma correspondeu ao mês selecionado. "
+                    "Não foi exibida uma confirmação falsa de atualização."
+                )
+            else:
+                st.success(f"Mercado atualizado para: {vencimento_busca}")
         else:
             st.error("Nenhuma opção foi coletada.")
+
+        for erro in erros:
+            st.warning(erro)
 
     if "dados" not in st.session_state:
         st.warning("Escolha o vencimento e clique em **Atualizar mercado**.")
     else:
         df = st.session_state.dados
         st.divider()
-        st.write(f"Vencimento carregado: **{st.session_state.get('vencimento_carregado', 'Indefinido')}**")
+        st.write(
+            f"Vencimento carregado: **{st.session_state.get('vencimento_carregado', 'Indefinido')}**"
+        )
         st.write(f"Opções analisadas: **{len(df)}**")
 
         if df.empty:
             st.warning("Nenhuma opção encontrada para esse vencimento.")
         else:
-            calls = df[df["tipo"] == "CALL"].sort_values("score_total", ascending=False).head(5)
-            puts = df[df["tipo"] == "PUT"].sort_values("score_total", ascending=False).head(5)
-            col_call, col_put = st.columns(2)
+            # Exibe até 3 melhores opções de cada empresa, evitando que uma única
+            # ação ocupe todo o ranking. Os seletores usam todas as opções coletadas.
+            calls_todas = df[df["tipo"] == "CALL"].sort_values("score_total", ascending=False)
+            puts_todas = df[df["tipo"] == "PUT"].sort_values("score_total", ascending=False)
+            calls = calls_todas.groupby("ativo", group_keys=False).head(3)
+            puts = puts_todas.groupby("ativo", group_keys=False).head(3)
 
+            col_call, col_put = st.columns(2)
             with col_call:
-                st.subheader("💜 Top CALLs hoje")
+                st.subheader("💜 Melhores CALLs por empresa")
                 if calls.empty:
                     st.warning("Nenhuma CALL encontrada.")
                     cod_call = None
                 else:
-                    st.dataframe(calls[[
-                        "ativo", "codigo", "mes", "strike", "ultimo", "premio_total",
-                        "cotacao_atual", "distancia_pct", "delta", "negocios", "diagnostico"
-                    ]], use_container_width=True, hide_index=True)
-                    cod_call = st.selectbox("Selecionar CALL", calls["codigo"], key="sel_call")
+                    st.dataframe(
+                        calls[[
+                            "ativo", "codigo", "mes", "strike", "ultimo",
+                            "retorno_premio_pct", "distancia_pct", "delta",
+                            "chance_exercicio", "volatilidade", "negocios", "diagnostico",
+                        ]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    cod_call = st.selectbox(
+                        "Selecionar CALL",
+                        calls_todas["codigo"].tolist(),
+                        key="sel_call",
+                    )
 
             with col_put:
-                st.subheader("🟢 Top PUTs hoje")
+                st.subheader("🟢 Melhores PUTs por empresa")
                 if puts.empty:
                     st.warning("Nenhuma PUT encontrada.")
                     cod_put = None
                 else:
-                    st.dataframe(puts[[
-                        "ativo", "codigo", "mes", "strike", "ultimo", "premio_total",
-                        "preco_efetivo_put", "distancia_pct", "delta", "negocios", "diagnostico"
-                    ]], use_container_width=True, hide_index=True)
-                    cod_put = st.selectbox("Selecionar PUT", puts["codigo"], key="sel_put")
+                    st.dataframe(
+                        puts[[
+                            "ativo", "codigo", "mes", "strike", "ultimo",
+                            "preco_efetivo_put", "retorno_premio_pct", "distancia_pct",
+                            "delta", "chance_exercicio", "volatilidade", "negocios",
+                            "diagnostico",
+                        ]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    cod_put = st.selectbox(
+                        "Selecionar PUT",
+                        puts_todas["codigo"].tolist(),
+                        key="sel_put",
+                    )
 
             st.divider()
             diag_call, diag_put = st.columns(2)
             with diag_call:
                 if cod_call:
-                    card_diagnostico(df[df["codigo"] == cod_call].iloc[0], "CALL")
+                    card_diagnostico(
+                        df[(df["codigo"] == cod_call) & (df["tipo"] == "CALL")].iloc[0],
+                        "CALL",
+                    )
             with diag_put:
                 if cod_put:
-                    card_diagnostico(df[df["codigo"] == cod_put].iloc[0], "PUT")
+                    card_diagnostico(
+                        df[(df["codigo"] == cod_put) & (df["tipo"] == "PUT")].iloc[0],
+                        "PUT",
+                    )
 
 with aba_operacoes:
     st.subheader("📒 Cadastro e acompanhamento")
     st.caption(
-        "O resultado é estimado para uma opção vendida: prêmio recebido menos o custo atual de recompra. "
-        "Não inclui corretagem, emolumentos, imposto nem eventual diferença entre último negócio e preço executável."
+        "O resultado é estimado para uma opção vendida: prêmio recebido menos o custo atual "
+        "de recompra. Não inclui corretagem, emolumentos, imposto nem diferença entre último "
+        "negócio e preço efetivamente executável."
     )
 
     with st.expander("➕ Cadastrar nova operação", expanded=st.session_state.operacoes.empty):
@@ -682,15 +771,23 @@ with aba_operacoes:
             strike = a4.number_input("Strike", min_value=0.0, step=0.01, format="%.2f")
 
             b1, b2, b3, b4 = st.columns(4)
-            premio = b1.number_input("Prêmio recebido por ação", min_value=0.0, step=0.01, format="%.2f")
-            quantidade = b2.number_input("Quantidade de ações", min_value=100, step=100, value=100)
+            premio = b1.number_input(
+                "Prêmio recebido por ação", min_value=0.0, step=0.01, format="%.2f"
+            )
+            quantidade = b2.number_input(
+                "Quantidade de ações", min_value=100, step=100, value=100
+            )
             vencimento = b3.date_input("Vencimento")
             cotacao_manual = b4.number_input(
-                "Cotação atual da opção (opcional)", min_value=0.0, step=0.01, format="%.2f",
-                help="Usada quando o código não está no último mercado carregado."
+                "Cotação atual da opção (opcional)",
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
+                help="Usada quando o código não está no último mercado carregado.",
             )
-
-            observacao = st.text_input("Observação", placeholder="Ex.: CALL coberta das 100 TIMS3")
+            observacao = st.text_input(
+                "Observação", placeholder="Ex.: CALL coberta das 100 TIMS3"
+            )
             salvar = st.form_submit_button("Salvar operação", type="primary")
 
             if salvar:
@@ -712,40 +809,42 @@ with aba_operacoes:
                         "observacao": observacao,
                     }
                     st.session_state.operacoes = pd.concat(
-                        [st.session_state.operacoes, pd.DataFrame([nova_linha])], ignore_index=True
+                        [st.session_state.operacoes, pd.DataFrame([nova_linha])],
+                        ignore_index=True,
                     )
                     salvar_operacoes(st.session_state.operacoes)
                     st.success("Operação cadastrada.")
                     st.rerun()
 
-    abertas = st.session_state.operacoes[st.session_state.operacoes["status"] == "ABERTA"].copy()
+    abertas = st.session_state.operacoes[
+        st.session_state.operacoes["status"] == "ABERTA"
+    ].copy()
 
     if abertas.empty:
         st.info("Nenhuma operação aberta cadastrada.")
     else:
         operacoes_calc = enriquecer_operacoes(abertas)
-
         total_recebido = operacoes_calc["valor_recebido"].sum()
         resultado_total = operacoes_calc["resultado_atual"].sum()
-        premio_pct_total = (resultado_total / total_recebido * 100) if total_recebido > 0 else 0
-
+        premio_pct_total = (
+            resultado_total / total_recebido * 100 if total_recebido > 0 else 0
+        )
         capital_total = operacoes_calc["capital_referencia"].sum()
-        rentabilidade_total = (resultado_total / capital_total * 100) if capital_total > 0 else 0
+        rentabilidade_total = (
+            resultado_total / capital_total * 100 if capital_total > 0 else 0
+        )
 
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Operações abertas", len(operacoes_calc))
         m2.metric("Prêmios recebidos", fmt_rs(total_recebido))
         m3.metric("Resultado atual estimado", fmt_rs(resultado_total))
         m4.metric("Prêmio capturado", fmt_pct(premio_pct_total))
-        m5.metric("Rentabilidade atual", fmt_pct(rentabilidade_total),
-                  help="Resultado atual dividido pelo capital de referência (strike × quantidade).")
+        m5.metric("Rentabilidade atual", fmt_pct(rentabilidade_total))
 
         st.divider()
         for _, op in operacoes_calc.iterrows():
             with st.container(border=True):
-                titulo = f"{op['tipo']} · {op['codigo']} · {op['ativo_base']}"
-                st.markdown(f"### {titulo}")
-
+                st.markdown(f"### {op['tipo']} · {op['codigo']} · {op['ativo_base']}")
                 c1, c2, c3, c4, c5, c6 = st.columns(6)
                 c1.metric("Strike", fmt_rs(op["strike"]))
                 c2.metric("Prêmio recebido", fmt_rs(op["premio_recebido"]))
@@ -755,16 +854,8 @@ with aba_operacoes:
                 c6.metric("Dias restantes", int(op["dias_restantes"]))
 
                 r1, r2, r3 = st.columns(3)
-                r1.metric(
-                    "Rentabilidade atual",
-                    fmt_pct(op["rentabilidade_atual_pct"]),
-                    help="Resultado atual ÷ (strike × quantidade)."
-                )
-                r2.metric(
-                    "Rentabilidade máxima",
-                    fmt_pct(op["rentabilidade_maxima_pct"]),
-                    help="Prêmio total recebido ÷ (strike × quantidade)."
-                )
+                r1.metric("Rentabilidade atual", fmt_pct(op["rentabilidade_atual_pct"]))
+                r2.metric("Rentabilidade máxima", fmt_pct(op["rentabilidade_maxima_pct"]))
                 r3.metric("Capital de referência", fmt_rs(op["capital_referencia"]))
 
                 gauge_col, diag_col = st.columns([1, 2])
@@ -778,24 +869,33 @@ with aba_operacoes:
                     d2.metric("Prêmio ainda em aberto", fmt_rs(premio_restante))
                     st.write(f"**Diagnóstico:** {op['sinal']}")
 
-                if pd.notna(op["observacao"]) and str(op["observacao"]).strip() not in ("", "nan"):
+                if pd.notna(op["observacao"]) and str(op["observacao"]).strip() not in {"", "nan"}:
                     st.caption(str(op["observacao"]))
 
                 e1, e2, e3 = st.columns([2, 2, 1])
                 nova_cotacao = e1.number_input(
-                    "Atualizar cotação manual", min_value=0.0, step=0.01,
-                    value=float(op["cotacao_atual_manual"]), format="%.2f",
-                    key=f"cot_{op['id']}"
+                    "Atualizar cotação manual",
+                    min_value=0.0,
+                    step=0.01,
+                    value=float(op["cotacao_atual_manual"]),
+                    format="%.2f",
+                    key=f"cot_{op['id']}",
                 )
                 if e2.button("💾 Salvar cotação", key=f"salvar_cot_{op['id']}"):
-                    idx = st.session_state.operacoes.index[st.session_state.operacoes["id"] == op["id"]]
+                    idx = st.session_state.operacoes.index[
+                        st.session_state.operacoes["id"] == op["id"]
+                    ]
                     if len(idx):
-                        st.session_state.operacoes.loc[idx[0], "cotacao_atual_manual"] = nova_cotacao
+                        st.session_state.operacoes.loc[
+                            idx[0], "cotacao_atual_manual"
+                        ] = nova_cotacao
                         salvar_operacoes(st.session_state.operacoes)
                         st.rerun()
 
                 if e3.button("✅ Encerrar", key=f"encerrar_{op['id']}"):
-                    idx = st.session_state.operacoes.index[st.session_state.operacoes["id"] == op["id"]]
+                    idx = st.session_state.operacoes.index[
+                        st.session_state.operacoes["id"] == op["id"]
+                    ]
                     if len(idx):
                         st.session_state.operacoes.loc[idx[0], "status"] = "ENCERRADA"
                         salvar_operacoes(st.session_state.operacoes)
@@ -804,86 +904,88 @@ with aba_operacoes:
                 with st.expander("✏️ Editar ou excluir esta operação"):
                     with st.form(f"editar_{op['id']}"):
                         x1, x2, x3, x4 = st.columns(4)
-                        edit_ativo = x1.text_input("Ativo-base", value=str(op["ativo_base"]), key=f"ea_{op['id']}").upper().strip()
-                        edit_codigo = x2.text_input("Código da opção", value=str(op["codigo"]), key=f"ec_{op['id']}").upper().strip()
+                        edit_ativo = x1.text_input(
+                            "Ativo-base", value=str(op["ativo_base"]), key=f"ea_{op['id']}"
+                        ).upper().strip()
+                        edit_codigo = x2.text_input(
+                            "Código da opção", value=str(op["codigo"]), key=f"ec_{op['id']}"
+                        ).upper().strip()
                         edit_tipo = x3.selectbox(
-                            "Tipo", ["CALL", "PUT"],
+                            "Tipo",
+                            ["CALL", "PUT"],
                             index=0 if str(op["tipo"]).upper() == "CALL" else 1,
-                            key=f"et_{op['id']}"
+                            key=f"et_{op['id']}",
                         )
                         edit_strike = x4.number_input(
-                            "Strike", min_value=0.0, step=0.01, value=float(op["strike"]),
-                            format="%.2f", key=f"es_{op['id']}"
+                            "Strike",
+                            min_value=0.0,
+                            step=0.01,
+                            value=float(op["strike"]),
+                            format="%.2f",
+                            key=f"es_{op['id']}",
                         )
 
                         y1, y2, y3, y4 = st.columns(4)
                         edit_premio = y1.number_input(
-                            "Prêmio recebido por ação", min_value=0.0, step=0.01,
-                            value=float(op["premio_recebido"]), format="%.2f", key=f"ep_{op['id']}"
+                            "Prêmio recebido por ação",
+                            min_value=0.0,
+                            step=0.01,
+                            value=float(op["premio_recebido"]),
+                            format="%.2f",
+                            key=f"ep_{op['id']}",
                         )
                         edit_quantidade = y2.number_input(
-                            "Quantidade de ações", min_value=100, step=100,
-                            value=int(op["quantidade"]), key=f"eq_{op['id']}"
+                            "Quantidade",
+                            min_value=100,
+                            step=100,
+                            value=int(op["quantidade"]),
+                            key=f"eq_{op['id']}",
                         )
                         try:
-                            data_venc = datetime.strptime(str(op["vencimento"])[:10], "%Y-%m-%d").date()
+                            data_edit = datetime.strptime(
+                                str(op["vencimento"])[:10], "%Y-%m-%d"
+                            ).date()
                         except ValueError:
-                            data_venc = date.today()
-                        edit_vencimento = y3.date_input("Vencimento", value=data_venc, key=f"ev_{op['id']}")
+                            data_edit = date.today()
+                        edit_vencimento = y3.date_input(
+                            "Vencimento", value=data_edit, key=f"ev_{op['id']}"
+                        )
                         edit_cotacao = y4.number_input(
-                            "Cotação atual manual", min_value=0.0, step=0.01,
-                            value=float(op["cotacao_atual_manual"]), format="%.2f", key=f"em_{op['id']}"
+                            "Cotação manual",
+                            min_value=0.0,
+                            step=0.01,
+                            value=float(op["cotacao_atual_manual"]),
+                            format="%.2f",
+                            key=f"em_{op['id']}",
                         )
                         edit_obs = st.text_input(
-                            "Observação", value=str(op["observacao"]) if pd.notna(op["observacao"]) else "",
-                            key=f"eo_{op['id']}"
+                            "Observação",
+                            value="" if pd.isna(op["observacao"]) else str(op["observacao"]),
+                            key=f"eo_{op['id']}",
                         )
-                        salvar_edicao = st.form_submit_button("💾 Salvar alterações", type="primary")
+                        salvar_edicao = st.form_submit_button("💾 Salvar alterações")
 
                         if salvar_edicao:
-                            idx = st.session_state.operacoes.index[st.session_state.operacoes["id"] == op["id"]]
+                            idx = st.session_state.operacoes.index[
+                                st.session_state.operacoes["id"] == op["id"]
+                            ]
                             if len(idx):
-                                i = idx[0]
-                                st.session_state.operacoes.loc[i, [
-                                    "ativo_base", "codigo", "tipo", "strike", "premio_recebido",
-                                    "quantidade", "vencimento", "cotacao_atual_manual", "observacao"
+                                st.session_state.operacoes.loc[idx[0], [
+                                    "ativo_base", "codigo", "tipo", "strike",
+                                    "premio_recebido", "quantidade", "vencimento",
+                                    "cotacao_atual_manual", "observacao",
                                 ]] = [
-                                    edit_ativo, edit_codigo, edit_tipo, edit_strike, edit_premio,
-                                    int(edit_quantidade), edit_vencimento.isoformat(), edit_cotacao, edit_obs
+                                    edit_ativo, edit_codigo, edit_tipo, edit_strike,
+                                    edit_premio, int(edit_quantidade), edit_vencimento.isoformat(),
+                                    edit_cotacao, edit_obs,
                                 ]
                                 salvar_operacoes(st.session_state.operacoes)
-                                st.success("Operação atualizada.")
+                                st.success("Alterações salvas.")
                                 st.rerun()
 
-                    confirmar = st.checkbox(
-                        "Confirmo que desejo excluir permanentemente esta operação",
-                        key=f"conf_del_{op['id']}"
-                    )
-                    if st.button("🗑️ Excluir operação", key=f"del_{op['id']}", disabled=not confirmar):
+                    if st.button("🗑️ Excluir definitivamente", key=f"excluir_{op['id']}"):
                         st.session_state.operacoes = st.session_state.operacoes[
                             st.session_state.operacoes["id"] != op["id"]
                         ].reset_index(drop=True)
                         salvar_operacoes(st.session_state.operacoes)
-                        st.success("Operação excluída.")
                         st.rerun()
-
-        st.divider()
-        st.subheader("Tabela consolidada")
-        tabela = operacoes_calc[[
-            "ativo_base", "codigo", "tipo", "strike", "premio_recebido", "quantidade",
-            "cotacao_atual", "valor_recebido", "resultado_atual", "premio_capturado_pct",
-            "capital_referencia", "rentabilidade_atual_pct", "rentabilidade_maxima_pct",
-            "dias_restantes", "sinal"
-        ]].copy()
-        st.dataframe(tabela, use_container_width=True, hide_index=True)
-
-        csv = tabela.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "⬇️ Exportar acompanhamento em CSV", csv,
-            file_name="acompanhamento_operacoes.csv", mime="text/csv"
-        )
-
-    encerradas = st.session_state.operacoes[st.session_state.operacoes["status"] == "ENCERRADA"]
-    if not encerradas.empty:
-        with st.expander(f"Histórico de encerradas ({len(encerradas)})"):
-            st.dataframe(encerradas, use_container_width=True, hide_index=True)
