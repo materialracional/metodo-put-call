@@ -436,7 +436,28 @@ def card_diagnostico(op, tipo):
     else:
         destaque = "🔴 OPORTUNIDADE FRACA"
 
-    st.markdown(f"## {tipo} · Parecer da oportunidade")
+    # Cabeçalho principal: deixa inequívoca a opção que está sendo analisada.
+    st.markdown(
+        f"""
+        <div style="
+            padding: 18px 22px;
+            border: 1px solid #dfe5ec;
+            border-radius: 16px;
+            background: #ffffff;
+            margin: 4px 0 16px 0;
+        ">
+            <div style="font-size:18px;color:#667085;font-weight:600;">Ativo-base</div>
+            <div style="font-size:36px;line-height:1.05;font-weight:800;color:#101828;">{ativo}</div>
+            <div style="margin-top:12px;font-size:17px;color:#667085;">Opção selecionada</div>
+            <div style="font-size:31px;line-height:1.10;font-weight:800;color:#101828;">{codigo}</div>
+            <div style="margin-top:12px;font-size:16px;color:#475467;">
+                {tipo} &nbsp;•&nbsp; Strike {fmt_rs(strike)} &nbsp;•&nbsp; Vencimento {data_vencimento}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.markdown(f"### {destaque}")
 
     q1, q2 = st.columns([1, 2])
