@@ -245,6 +245,39 @@ def selecionar_vencimento(driver, vencimento_texto):
     return False
 
 
+def aceitar_dados_fechamento(driver):
+    textos = [
+        "Continuar com dados de fechamento",
+        "Continuar",
+        "Aceitar",
+        "OK",
+    ]
+
+    for texto in textos:
+        try:
+            elementos = driver.find_elements(
+                By.XPATH,
+                f"//*[contains(normalize-space(text()), '{texto}')]"
+            )
+
+            for elemento in elementos:
+                try:
+                    if elemento.is_displayed() and elemento.is_enabled():
+                        driver.execute_script(
+                            "arguments[0].click();",
+                            elemento
+                        )
+                        time.sleep(2)
+                        return True
+                except:
+                    pass
+
+        except:
+            pass
+
+    return False
+
+
 def coletar_opcoes(ativo, vencimento_escolhido):
     url = f"https://opcoes.net.br/opcoes/bovespa/{ativo}"
     driver = None
