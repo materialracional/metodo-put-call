@@ -372,6 +372,25 @@ def preparar(df):
     df["diagnostico"] = df["score_total"].apply(
         lambda x: "Muito boa" if x >= 10 else "Boa" if x >= 8 else "Regular" if x >= 6 else "Fraca"
     )
+
+    # Indicadores objetivos usados na comparação das oportunidades.
+    df["chance_exercicio_pct"] = df["delta"].abs().clip(upper=1) * 100
+    df["retorno_pct"] = df.apply(
+        lambda r: (r["ultimo"] / r["cotacao_atual"] * 100)
+        if r["cotacao_atual"] > 0 else 0,
+        axis=1,
+    )
+    df["venda_efetiva_pct"] = df.apply(
+        lambda r: ((r["venda_efetiva_call"] / r["cotacao_atual"]) - 1) * 100
+        if r["cotacao_atual"] > 0 else 0,
+        axis=1,
+    )
+    df["precisa_subir_pct"] = df["distancia_pct"]
+    df["custo_efetivo_pct"] = df.apply(
+        lambda r: ((r["preco_efetivo_put"] / r["cotacao_atual"]) - 1) * 100
+        if r["cotacao_atual"] > 0 else 0,
+        axis=1,
+    )
     return df
 
 
@@ -380,8 +399,30 @@ def badge_diag(diag):
     return f"{cores.get(diag, '⚪')} {diag}"
 
 
+def classificar_chance_exercicio(delta):
+    """Converte o módulo do Delta em chance implícita aproximada e faixa textual."""
+    chance = min(max(abs(float(delta or 0)) * 100, 0), 100)
+    if chance <= 20:
+        return chance, "Muito baixa", "🟢"
+    if chance <= 40:
+        return chance, "Baixa", "🟢"
+    if chance <= 60:
+        return chance, "Moderada", "🟡"
+    if chance <= 80:
+        return chance, "Alta", "🟠"
+    return chance, "Muito alta", "🔴"
+
+
+def descricao_exercicio_call(distancia):
+    """Texto objetivo sobre o movimento necessário até o strike da CALL."""
+    if distancia > 0:
+        return f"Precisa subir {distancia:.2f}%"
+    if distancia < 0:
+        return f"Strike já foi ultrapassado em {abs(distancia):.2f}%"
+    return "No strike"
+
 def card_diagnostico(op, tipo):
-    """Exibe a oportunidade em linguagem direta para o investidor."""
+    """Exibe o parecer da oportunidade em linguagem prática e objetiva."""
 
     tipo = str(tipo).upper().strip()
     ativo = str(op["ativo"]).upper().strip()
@@ -389,68 +430,37 @@ def card_diagnostico(op, tipo):
 
     cotacao = float(op.get("cotacao_atual", 0) or 0)
     strike = float(op.get("strike", 0) or 0)
-    premio_total = float(op.get("premio_total", 0) or 0)
+    premio_por_acao = float(op.get("ultimo", 0) or 0)
+    premio_total = float(op.get("premio_total", premio_por_acao * 100) or 0)
     distancia = float(op.get("distancia_pct", 0) or 0)
     delta = float(op.get("delta", 0) or 0)
     negocios = int(float(op.get("negocios", 0) or 0))
-    diagnostico = str(op.get("diagnostico", "Indefinido"))
-    score_total = float(op.get("score_total", 0) or 0)
+    retorno_pct = float(op.get("retorno_pct", 0) or 0)
+    chance_implicita, chance_texto, chance_icone = classificar_chance_exercicio(delta)
 
-    chance_implicita = min(abs(delta) * 100, 100)
-    qualidade = min(max(score_total / 12 * 100, 0), 100)
-
-    vencimento_carregado = str(
-        st.session_state.get("vencimento_carregado", "")
+    vencimento_carregado = str(st.session_state.get("vencimento_carregado", ""))
+    data_vencimento = (
+        vencimento_carregado.split(" - ", 1)[1]
+        if " - " in vencimento_carregado
+        else vencimento_carregado or "o vencimento"
     )
-    if " - " in vencimento_carregado:
-        data_vencimento = vencimento_carregado.split(" - ", 1)[1]
-    else:
-        data_vencimento = vencimento_carregado or "o vencimento"
 
     if negocios >= 20:
-        liquidez_texto = "Boa"
-        liquidez_icone = "🟢"
+        liquidez_texto, liquidez_icone = "Boa", "🟢"
     elif negocios >= 5:
-        liquidez_texto = "Moderada"
-        liquidez_icone = "🟡"
+        liquidez_texto, liquidez_icone = "Moderada", "🟡"
     else:
-        liquidez_texto = "Baixa"
-        liquidez_icone = "🟠"
+        liquidez_texto, liquidez_icone = "Baixa", "🟠"
 
-    if chance_implicita < 25:
-        chance_texto = "Baixa"
-        chance_icone = "🟢"
-    elif chance_implicita < 50:
-        chance_texto = "Moderada"
-        chance_icone = "🟡"
-    else:
-        chance_texto = "Alta"
-        chance_icone = "🔴"
-
-    if diagnostico == "Muito boa":
-        destaque = "🟢 MUITO BOA OPORTUNIDADE"
-    elif diagnostico == "Boa":
-        destaque = "🟡 BOA OPORTUNIDADE"
-    elif diagnostico == "Regular":
-        destaque = "🟠 OPORTUNIDADE REGULAR"
-    else:
-        destaque = "🔴 OPORTUNIDADE FRACA"
-
-    # Cabeçalho principal: deixa inequívoca a opção que está sendo analisada.
     st.markdown(
         f"""
-        <div style="
-            padding: 18px 22px;
-            border: 1px solid #dfe5ec;
-            border-radius: 16px;
-            background: #ffffff;
-            margin: 4px 0 16px 0;
-        ">
-            <div style="font-size:18px;color:#667085;font-weight:600;">Ativo-base</div>
-            <div style="font-size:36px;line-height:1.05;font-weight:800;color:#101828;">{ativo}</div>
-            <div style="margin-top:12px;font-size:17px;color:#667085;">Opção selecionada</div>
-            <div style="font-size:31px;line-height:1.10;font-weight:800;color:#101828;">{codigo}</div>
-            <div style="margin-top:12px;font-size:16px;color:#475467;">
+        <div style="padding:18px 22px;border:1px solid #dfe5ec;border-radius:16px;
+                    background:#ffffff;margin:4px 0 16px 0;">
+            <div style="font-size:17px;color:#667085;font-weight:600;">Ativo-base</div>
+            <div style="font-size:34px;line-height:1.05;font-weight:800;color:#101828;">{ativo}</div>
+            <div style="margin-top:10px;font-size:16px;color:#667085;">Opção selecionada</div>
+            <div style="font-size:30px;line-height:1.10;font-weight:800;color:#101828;">{codigo}</div>
+            <div style="margin-top:10px;font-size:15px;color:#475467;">
                 {tipo} &nbsp;•&nbsp; Strike {fmt_rs(strike)} &nbsp;•&nbsp; Vencimento {data_vencimento}
             </div>
         </div>
@@ -458,134 +468,101 @@ def card_diagnostico(op, tipo):
         unsafe_allow_html=True,
     )
 
-    st.markdown(f"### {destaque}")
-
-    q1, q2 = st.columns([1, 2])
-    with q1:
-        st.metric("Qualidade", f"{qualidade:.0f}/100")
-    with q2:
-        st.progress(int(qualidade))
-        st.caption(
-            "A qualidade combina prêmio, liquidez e distância do strike."
-        )
-
-    st.divider()
+    st.markdown("### Parecer da oportunidade")
 
     if tipo == "CALL":
-        distancia_exercicio = max(distancia, 0)
-        valor_exercicio = float(op.get("venda_efetiva_call", strike + (premio_total / 100)) or 0)
+        venda_efetiva = float(op.get("venda_efetiva_call", strike + premio_por_acao) or 0)
+        venda_acima_pct = (
+            ((venda_efetiva / cotacao) - 1) * 100 if cotacao > 0 else 0
+        )
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Você recebe hoje", fmt_rs(premio_total))
-        c2.metric("Se for exercido, receberá", fmt_rs(valor_exercicio), help="Strike + prêmio recebido por ação.")
-        c3.metric("Chance implícita de ser exercido", f"{chance_implicita:.0f}%", delta=chance_texto, delta_color="off")
-        c4.metric("Liquidez", f"{liquidez_icone} {liquidez_texto}", help=f"{negocios} negócios no último pregão.")
+        c1.metric("Você recebe hoje", fmt_rs(premio_total), f"{retorno_pct:.2f}%".replace(".", ","))
+        c2.metric("Se for exercido, venderá por", fmt_rs(venda_efetiva),
+                  f"{venda_acima_pct:+.2f}% vs. hoje".replace(".", ","))
+        c3.metric("Chance implícita de exercício", f"{chance_implicita:.0f}%",
+                  f"{chance_icone} {chance_texto}", delta_color="off")
+        c4.metric("Liquidez", f"{liquidez_icone} {liquidez_texto}",
+                  help=f"{negocios} negócios no último pregão.")
+
+        if distancia > 0:
+            chamada = f"{ativo} precisa subir"
+            movimento = f"{distancia:.2f}%"
+            complemento = f"até {data_vencimento}"
+        elif distancia < 0:
+            chamada = "O strike já foi ultrapassado"
+            movimento = f"{abs(distancia):.2f}%"
+            complemento = "A opção já está dentro do dinheiro pela cotação atual."
+        else:
+            chamada = f"{ativo} está no strike"
+            movimento = "0,00%"
+            complemento = f"Vencimento em {data_vencimento}"
 
         st.markdown(
             f"""
-            <div style="padding:22px;border-radius:14px;background:#f5f7fb;margin:14px 0 18px 0;text-align:center;">
+            <div style="padding:22px;border-radius:14px;background:#f5f7fb;
+                        margin:14px 0 18px 0;text-align:center;">
                 <div style="font-size:16px;color:#5f6b7a;">📈 Para ocorrer o exercício</div>
-                <div style="font-size:22px;font-weight:600;margin-top:5px;">{ativo} precisa subir</div>
-                <div style="font-size:44px;font-weight:800;line-height:1.15;">{distancia_exercicio:.2f}%</div>
-                <div style="font-size:17px;color:#5f6b7a;">até {data_vencimento}</div>
+                <div style="font-size:22px;font-weight:600;margin-top:5px;">{chamada}</div>
+                <div style="font-size:44px;font-weight:800;line-height:1.15;">{movimento}</div>
+                <div style="font-size:17px;color:#5f6b7a;">{complemento}</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        pontos_positivos = []
-        pontos_atencao = []
-
-        if distancia_exercicio >= 4:
-            pontos_positivos.append(f"O strike está {distancia_exercicio:.2f}% acima da cotação atual.")
-        elif distancia_exercicio >= 2:
-            pontos_positivos.append(f"Existe uma margem de {distancia_exercicio:.2f}% até o strike.")
+        if distancia < 0:
+            parecer = (
+                f"Esta CALL paga {fmt_rs(premio_total)} por lote, mas o strike de {fmt_rs(strike)} "
+                f"já está abaixo da cotação atual de {fmt_rs(cotacao)}. Somando o prêmio, a venda "
+                f"efetiva seria de {fmt_rs(venda_efetiva)}, ou {venda_acima_pct:.2f}% em relação ao "
+                f"preço de hoje. A chance implícita de exercício é {chance_texto.lower()} ({chance_implicita:.0f}%)."
+            )
         else:
-            pontos_atencao.append(f"O strike está próximo: apenas {distancia_exercicio:.2f}% acima da cotação.")
-
-        if chance_implicita < 35:
-            pontos_positivos.append(f"A chance implícita indicada pelo Delta é de aproximadamente {chance_implicita:.0f}%.")
-        else:
-            pontos_atencao.append(f"A chance implícita indicada pelo Delta é de aproximadamente {chance_implicita:.0f}%.")
-
-        if negocios >= 5:
-            pontos_positivos.append(f"A opção registrou {negocios} negócios no último pregão.")
-        else:
-            pontos_atencao.append(f"Liquidez baixa: apenas {negocios} negócio(s) no último pregão.")
-
-        parecer = (
-            f"Esta CALL paga {fmt_rs(premio_total)} por lote e permite uma venda efetiva "
-            f"aproximada de {fmt_rs(valor_exercicio)} por ação. "
-            f"Para haver exercício, {ativo} precisa subir {distancia_exercicio:.2f}% até {data_vencimento}."
-        )
-        reflexao = (
-            f"Você ficaria satisfeito em vender suas ações de {ativo} por "
-            f"aproximadamente {fmt_rs(valor_exercicio)} por ação?"
-        )
+            parecer = (
+                f"Esta CALL paga {fmt_rs(premio_total)} por lote, equivalente a {retorno_pct:.2f}% "
+                f"sobre a cotação atual. Se houver exercício, suas ações serão vendidas por "
+                f"{fmt_rs(venda_efetiva)} por ação, {venda_acima_pct:.2f}% acima do preço de hoje. "
+                f"Para isso ocorrer, {ativo} precisa subir {distancia:.2f}% até {data_vencimento}. "
+                f"A chance implícita é {chance_texto.lower()} ({chance_implicita:.0f}%)."
+            )
+        reflexao = f"Você ficaria satisfeito em vender suas ações por {fmt_rs(venda_efetiva)} por ação?"
 
     else:
-        distancia_exercicio = abs(min(distancia, 0)) if distancia < 0 else distancia
-        valor_exercicio = float(op.get("preco_efetivo_put", strike - (premio_total / 100)) or 0)
+        custo_efetivo = float(op.get("preco_efetivo_put", strike - premio_por_acao) or 0)
+        desconto_pct = ((custo_efetivo / cotacao) - 1) * 100 if cotacao > 0 else 0
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Você recebe hoje", fmt_rs(premio_total))
-        c2.metric("Se for exercido, comprará por", fmt_rs(valor_exercicio), help="Strike menos o prêmio recebido por ação.")
-        c3.metric("Chance implícita de ser exercido", f"{chance_implicita:.0f}%", delta=chance_texto, delta_color="off")
-        c4.metric("Liquidez", f"{liquidez_icone} {liquidez_texto}", help=f"{negocios} negócios no último pregão.")
+        c1.metric("Você recebe hoje", fmt_rs(premio_total), f"{retorno_pct:.2f}%".replace(".", ","))
+        c2.metric("Se for exercido, comprará por", fmt_rs(custo_efetivo),
+                  f"{desconto_pct:+.2f}% vs. hoje".replace(".", ","))
+        c3.metric("Chance implícita de exercício", f"{chance_implicita:.0f}%",
+                  f"{chance_icone} {chance_texto}", delta_color="off")
+        c4.metric("Liquidez", f"{liquidez_icone} {liquidez_texto}",
+                  help=f"{negocios} negócios no último pregão.")
 
         movimento = abs(distancia)
+        direcao = "cair" if distancia < 0 else "subir"
         st.markdown(
             f"""
-            <div style="padding:22px;border-radius:14px;background:#f5f7fb;margin:14px 0 18px 0;text-align:center;">
-                <div style="font-size:16px;color:#5f6b7a;">📉 Para ocorrer o exercício</div>
-                <div style="font-size:22px;font-weight:600;margin-top:5px;">{ativo} precisa chegar ao strike</div>
-                <div style="font-size:44px;font-weight:800;line-height:1.15;">{movimento:.2f}% de distância</div>
+            <div style="padding:22px;border-radius:14px;background:#f5f7fb;
+                        margin:14px 0 18px 0;text-align:center;">
+                <div style="font-size:16px;color:#5f6b7a;">📉 Para chegar ao strike</div>
+                <div style="font-size:22px;font-weight:600;margin-top:5px;">{ativo} precisa {direcao}</div>
+                <div style="font-size:44px;font-weight:800;line-height:1.15;">{movimento:.2f}%</div>
                 <div style="font-size:17px;color:#5f6b7a;">até {data_vencimento}</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        pontos_positivos = []
-        pontos_atencao = []
-
-        if chance_implicita < 35:
-            pontos_positivos.append(f"A chance implícita indicada pelo Delta é de aproximadamente {chance_implicita:.0f}%.")
-        else:
-            pontos_atencao.append(f"A chance implícita indicada pelo Delta é de aproximadamente {chance_implicita:.0f}%.")
-
-        if negocios >= 5:
-            pontos_positivos.append(f"A opção registrou {negocios} negócios no último pregão.")
-        else:
-            pontos_atencao.append(f"Liquidez baixa: apenas {negocios} negócio(s) no último pregão.")
-
-        pontos_positivos.append(f"O custo líquido, em caso de exercício, seria aproximadamente {fmt_rs(valor_exercicio)} por ação.")
-
         parecer = (
-            f"Esta PUT paga {fmt_rs(premio_total)} por lote e pode resultar na compra de {ativo} "
-            f"por um custo líquido aproximado de {fmt_rs(valor_exercicio)} por ação."
+            f"Esta PUT paga {fmt_rs(premio_total)} por lote, equivalente a {retorno_pct:.2f}% "
+            f"sobre a cotação atual. Se houver exercício, o custo líquido de compra será "
+            f"{fmt_rs(custo_efetivo)} por ação ({desconto_pct:+.2f}% em relação ao preço de hoje). "
+            f"A chance implícita é {chance_texto.lower()} ({chance_implicita:.0f}%)."
         )
-        reflexao = (
-            f"Você ficaria satisfeito em comprar {ativo} por aproximadamente "
-            f"{fmt_rs(valor_exercicio)} por ação?"
-        )
-
-    p1, p2 = st.columns(2)
-    with p1:
-        st.markdown("#### Pontos positivos")
-        if pontos_positivos:
-            for item in pontos_positivos:
-                st.write(f"✅ {item}")
-        else:
-            st.caption("Nenhum ponto positivo relevante identificado.")
-
-    with p2:
-        st.markdown("#### Pontos de atenção")
-        if pontos_atencao:
-            for item in pontos_atencao:
-                st.write(f"⚠️ {item}")
-        else:
-            st.write("✅ Nenhum alerta relevante identificado.")
+        reflexao = f"Você ficaria satisfeito em comprar {ativo} por {fmt_rs(custo_efetivo)} por ação?"
 
     st.markdown("#### Parecer")
     st.info(parecer)
@@ -605,8 +582,7 @@ def card_diagnostico(op, tipo):
         t6.metric("Situação técnica", str(op.get("situacao", "")))
         t7.metric("Distância do strike", f"{distancia:.2f}%".replace(".", ","))
         t8.metric("Negócios", negocios)
-        t9.metric("Diagnóstico interno", diagnostico)
-
+        t9.metric("Volatilidade implícita", f"{float(op.get('volatilidade', 0) or 0):.2f}%".replace(".", ","))
 
 def render_velocimetro(percentual):
     """Velocímetro semicircular em HTML/CSS, sem dependências extras."""
@@ -827,33 +803,85 @@ with aba_oportunidades:
         if df.empty:
             st.warning("Nenhuma opção encontrada para esse vencimento.")
         else:
-            calls = df[df["tipo"] == "CALL"].sort_values("score_total", ascending=False).head(5)
-            puts = df[df["tipo"] == "PUT"].sort_values("score_total", ascending=False).head(5)
+            st.markdown("### Comparar oportunidades")
+            criterio_ordem = st.selectbox(
+                "Ordenar opções por:",
+                [
+                    "Maior retorno",
+                    "Menor chance implícita de exercício",
+                    "Maior venda efetiva / menor custo efetivo",
+                    "Maior distância até o strike",
+                    "Maior liquidez",
+                ],
+                key="criterio_ordenacao_oportunidades",
+            )
+
+            calls_todas = df[df["tipo"] == "CALL"].copy()
+            puts_todas = df[df["tipo"] == "PUT"].copy()
+
+            if criterio_ordem == "Maior retorno":
+                calls_todas = calls_todas.sort_values("retorno_pct", ascending=False)
+                puts_todas = puts_todas.sort_values("retorno_pct", ascending=False)
+            elif criterio_ordem == "Menor chance implícita de exercício":
+                calls_todas = calls_todas.sort_values("chance_exercicio_pct", ascending=True)
+                puts_todas = puts_todas.sort_values("chance_exercicio_pct", ascending=True)
+            elif criterio_ordem == "Maior venda efetiva / menor custo efetivo":
+                calls_todas = calls_todas.sort_values("venda_efetiva_call", ascending=False)
+                puts_todas = puts_todas.sort_values("preco_efetivo_put", ascending=True)
+            elif criterio_ordem == "Maior distância até o strike":
+                calls_todas = calls_todas.sort_values("distancia_pct", ascending=False)
+                puts_todas = puts_todas.assign(
+                    distancia_ordenacao=puts_todas["distancia_pct"].abs()
+                ).sort_values("distancia_ordenacao", ascending=False)
+            else:
+                calls_todas = calls_todas.sort_values("negocios", ascending=False)
+                puts_todas = puts_todas.sort_values("negocios", ascending=False)
+
+            calls = calls_todas.head(10).copy()
+            puts = puts_todas.head(10).copy()
+
+            for tabela_op in (calls, puts):
+                tabela_op["Retorno"] = tabela_op["retorno_pct"].map(lambda x: f"{x:.2f}%".replace(".", ","))
+                tabela_op["Chance implícita"] = tabela_op["chance_exercicio_pct"].map(
+                    lambda x: f"{x:.0f}% · {classificar_chance_exercicio(x / 100)[1]}"
+                )
+
+            calls["Venda efetiva"] = calls["venda_efetiva_call"].map(fmt_rs)
+            calls["Precisa subir"] = calls["distancia_pct"].map(descricao_exercicio_call)
+            puts["Custo efetivo"] = puts["preco_efetivo_put"].map(fmt_rs)
+            puts["Distância do strike"] = puts["distancia_pct"].map(
+                lambda x: f"{abs(x):.2f}%".replace(".", ",")
+            )
+
             col_call, col_put = st.columns(2)
 
             with col_call:
-                st.subheader("💜 Top CALLs hoje")
+                st.subheader("💜 CALLs")
                 if calls.empty:
                     st.warning("Nenhuma CALL encontrada.")
                     cod_call = None
                 else:
-                    st.dataframe(calls[[
-                        "ativo", "codigo", "mes", "strike", "ultimo", "premio_total",
-                        "cotacao_atual", "distancia_pct", "delta", "negocios", "diagnostico"
-                    ]], use_container_width=True, hide_index=True)
-                    cod_call = st.selectbox("Selecionar CALL", calls["codigo"], key="sel_call")
+                    st.dataframe(
+                        calls[["ativo", "codigo", "Retorno", "Venda efetiva", "Precisa subir", "Chance implícita"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    opcoes_call = calls_todas.sort_values(["ativo", "strike"])["codigo"].drop_duplicates().tolist()
+                    cod_call = st.selectbox("Selecionar CALL para o Parecer", opcoes_call, key="sel_call")
 
             with col_put:
-                st.subheader("🟢 Top PUTs hoje")
+                st.subheader("🟢 PUTs")
                 if puts.empty:
                     st.warning("Nenhuma PUT encontrada.")
                     cod_put = None
                 else:
-                    st.dataframe(puts[[
-                        "ativo", "codigo", "mes", "strike", "ultimo", "premio_total",
-                        "preco_efetivo_put", "distancia_pct", "delta", "negocios", "diagnostico"
-                    ]], use_container_width=True, hide_index=True)
-                    cod_put = st.selectbox("Selecionar PUT", puts["codigo"], key="sel_put")
+                    st.dataframe(
+                        puts[["ativo", "codigo", "Retorno", "Custo efetivo", "Distância do strike", "Chance implícita"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    opcoes_put = puts_todas.sort_values(["ativo", "strike"])["codigo"].drop_duplicates().tolist()
+                    cod_put = st.selectbox("Selecionar PUT para o Parecer", opcoes_put, key="sel_put")
 
             st.divider()
             diag_call, diag_put = st.columns(2)
