@@ -8,6 +8,8 @@ import streamlit as st
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+
 
 
 st.set_page_config(page_title="Método PUT + CALL", layout="wide")
@@ -88,30 +90,23 @@ def mes_opcao(codigo):
 
 def criar_driver():
     options = Options()
+
+    options.binary_location = "/usr/bin/chromium"
+
     options.add_argument("--headless=new")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    return webdriver.Chrome(options=options)
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--remote-debugging-port=9222")
 
+    service = Service("/usr/bin/chromedriver")
 
-def aceitar_dados_fechamento(driver):
-    textos = ["Continuar com dados de fechamento", "Continuar", "Aceitar", "OK"]
-    for texto in textos:
-        try:
-            elementos = driver.find_elements(
-                By.XPATH, f"//*[contains(normalize-space(text()), '{texto}')]"
-            )
-            for el in elementos:
-                if el.is_displayed() and el.is_enabled():
-                    driver.execute_script("arguments[0].click();", el)
-                    time.sleep(2)
-                    return True
-        except Exception:
-            continue
-    return False
-
+    return webdriver.Chrome(
+        service=service,
+        options=options
+    )
 
 def extrair_tabela_visivel(driver, ativo, tipo):
     """Extrai a grade atual do Opções.Net.Br.
