@@ -17,26 +17,11 @@ st.set_page_config(page_title="Método PUT + CALL", layout="wide")
 ARQUIVO_OPERACOES = Path("operacoes_abertas.csv")
 
 COLUNAS = {
-    # Ordem real da grade principal do Opções.Net.Br em 15/07/2026
-    0: "codigo",
-    1: "tipo",
-    2: "fm",
-    3: "estilo",
-    4: "strike",
-    5: "situacao",
-    6: "distancia_pct",
-    7: "ultimo",
-    8: "variacao_pct",
-    9: "data_ultimo_negocio",
-    10: "negocios",
-    11: "volume",
-    12: "volatilidade",
-    13: "delta",
-    14: "gamma",
-    15: "theta",
-    16: "theta_pct",
-    17: "vega",
-    18: "iq",
+    0: "codigo", 1: "check", 2: "estilo", 3: "strike",
+    4: "situacao", 5: "distancia_pct", 6: "ultimo", 7: "variacao_pct",
+    8: "data_ultimo_negocio", 9: "negocios", 10: "volume",
+    11: "volatilidade", 12: "delta", 13: "gamma", 14: "theta",
+    15: "theta_pct", 16: "vega", 17: "iq",
 }
 
 MESES = {
@@ -125,11 +110,19 @@ def criar_driver():
         options=options
     )
 
-def extrair_tabela_visivel(driver, ativo):
-    """Extrai somente as linhas da grade principal de opções."""
+def extrair_tabela_visivel(driver, ativo, tipo):
+    """
+    Extrai a grade atual do Opções.Net.Br.
+
+    A página atual não traz uma coluna de tipo dentro da tabela;
+    CALL/PUT é definido pelo seletor acima da grade. Por isso o
+    tipo é recebido como argumento e gravado em todas as linhas.
+    """
+
     linhas = []
 
     for tabela in driver.find_elements(By.TAG_NAME, "table"):
+
         try:
             if not tabela.is_displayed():
                 continue
@@ -137,37 +130,62 @@ def extrair_tabela_visivel(driver, ativo):
             continue
 
         for row in tabela.find_elements(By.TAG_NAME, "tr"):
+
             cols = row.find_elements(By.TAG_NAME, "td")
             dados = [c.text.strip() for c in cols]
 
-            # A grade principal possui ao menos 19 colunas.
-            # Outras tabelas da página são ignoradas.
-            if len(dados) < 19:
-                continue
+            if dados:
+                print("=" * 80)
+                print(f"DEBUG {ativo}")
+                print(f"Quantidade de colunas: {len(dados)}")
+                print(dados)
 
-            codigo = dados[0].upper().strip()
-            tipo = dados[1].upper().strip()
-
-            # Mantém apenas opções do ativo solicitado.
-            if not codigo.startswith(ativo[:4].upper()):
-                continue
-            if tipo not in ("CALL", "PUT"):
-                continue
-
-            linhas.append(dados[:19])
+                linhas.append(dados)
 
     colunas_finais = [
-        "ativo", "codigo", "tipo", "fm", "estilo", "strike", "situacao",
-        "distancia_pct", "ultimo", "variacao_pct", "data_ultimo_negocio",
-        "negocios", "volume", "volatilidade", "delta", "gamma", "theta",
-        "theta_pct", "vega", "iq",
+        "ativo",
+        "codigo",
+        "tipo",
+        "estilo",
+        "strike",
+        "situacao",
+        "distancia_pct",
+        "ultimo",
+        "variacao_pct",
+        "data_ultimo_negocio",
+        "negocios",
+        "volume",
+        "volatilidade",
+        "delta",
+        "gamma",
+        "theta",
+        "vega",
+        "lambda",
     ]
 
     if not linhas:
         return pd.DataFrame(columns=colunas_finais)
 
-    df = pd.DataFrame(linhas).rename(columns=COLUNAS)
+    # Descobre automaticamente a maior linha encontrada
+    largura = max(len(x) for x in linhas)
+
+    # Completa as menores
+    linhas = [x + [""] * (largura - len(x)) for x in linhas]
+
+    df = pd.DataFrame(linhas)
+
+    # Renomeia somente as colunas conhecidas
+    for i, nome in COLUNAS.items():
+        if i < len(df.columns):
+            df.rename(columns={i: nome}, inplace=True)
+
+    # Garante que existam todas as colunas
+    for c in colunas_finais:
+        if c not in df.columns:
+            df[c] = ""
+
     df["ativo"] = ativo
+    df["tipo"] = tipo
 
     return df[colunas_finais]
 
@@ -294,7 +312,6 @@ def aceitar_dados_fechamento(driver):
 def coletar_opcoes(ativo, vencimento_escolhido):
     url = f"https://opcoes.net.br/opcoes/bovespa/{ativo}"
     driver = None
-
     try:
         driver = criar_driver()
         driver.get(url)
@@ -305,19 +322,29 @@ def coletar_opcoes(ativo, vencimento_escolhido):
         if vencimento_texto and not selecionar_vencimento(driver, vencimento_texto):
             return pd.DataFrame()
 
-        # A grade em "TODAS" já contém CALLs e PUTs.
-        time.sleep(4)
-        return extrair_tabela_visivel(driver, ativo)
+        partes = []
+        for tipo in ["CALL", "PUT"]:
+            if selecionar_tipo(driver, tipo):
+                parte = extrair_tabela_visivel(driver, ativo, tipo)
+                if not parte.empty:
+                    partes.append(parte)
 
+        if not partes:
+            return pd.DataFrame()
+
+        return pd.concat(partes, ignore_index=True).drop_duplicates(
+            subset=["ativo", "codigo", "tipo"], keep="first"
+        )
     finally:
         if driver is not None:
             driver.quit()
+
 
 def preparar(df):
     df = df.copy()
     for col in [
         "strike", "distancia_pct", "ultimo", "variacao_pct", "negocios", "volume",
-        "volatilidade", "delta", "gamma", "theta", "theta_pct", "vega", "iq"
+        "volatilidade", "delta", "gamma", "theta", "vega", "lambda"
     ]:
         df[col] = df[col].apply(moeda_para_float)
 
@@ -354,33 +381,201 @@ def badge_diag(diag):
 
 
 def card_diagnostico(op, tipo):
-    st.markdown(f"### {tipo} · Diagnóstico")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Ativo", op["ativo"])
-    c2.metric("Código", op["codigo"])
-    c3.metric("Cotação atual", fmt_rs(op["cotacao_atual"]))
-    c4.metric("Strike", fmt_rs(op["strike"]))
-    c5.metric("Prêmio por lote", fmt_rs(op["premio_total"]))
+    """Exibe a oportunidade em linguagem direta para o investidor."""
 
-    c6, c7, c8, c9, c10 = st.columns(5)
-    if tipo == "PUT":
-        c6.metric("Preço efetivo", fmt_rs(op["preco_efetivo_put"]))
-    else:
-        c6.metric("Venda efetiva", fmt_rs(op["venda_efetiva_call"]))
-    c7.metric("Situação", op["situacao"])
-    c8.metric("Delta", f"{op['delta']:.3f}".replace(".", ","))
-    c9.metric("Negócios", int(op["negocios"]))
-    c10.metric("Diagnóstico", op["diagnostico"])
+    tipo = str(tipo).upper().strip()
+    ativo = str(op["ativo"]).upper().strip()
+    codigo = str(op["codigo"]).upper().strip()
 
-    texto = (
-        f"{tipo} {badge_diag(op['diagnostico'])}. Prêmio de {fmt_rs(op['premio_total'])} por lote. "
-        + (f"Compra efetiva aproximada em {fmt_rs(op['preco_efetivo_put'])}."
-           if tipo == "PUT" else
-           f"Venda efetiva aproximada em {fmt_rs(op['venda_efetiva_call'])}.")
+    cotacao = float(op.get("cotacao_atual", 0) or 0)
+    strike = float(op.get("strike", 0) or 0)
+    premio_total = float(op.get("premio_total", 0) or 0)
+    distancia = float(op.get("distancia_pct", 0) or 0)
+    delta = float(op.get("delta", 0) or 0)
+    negocios = int(float(op.get("negocios", 0) or 0))
+    diagnostico = str(op.get("diagnostico", "Indefinido"))
+    score_total = float(op.get("score_total", 0) or 0)
+
+    chance_implicita = min(abs(delta) * 100, 100)
+    qualidade = min(max(score_total / 12 * 100, 0), 100)
+
+    vencimento_carregado = str(
+        st.session_state.get("vencimento_carregado", "")
     )
-    (st.success if tipo == "PUT" else st.info)(texto)
+    if " - " in vencimento_carregado:
+        data_vencimento = vencimento_carregado.split(" - ", 1)[1]
+    else:
+        data_vencimento = vencimento_carregado or "o vencimento"
 
+    if negocios >= 20:
+        liquidez_texto = "Boa"
+        liquidez_icone = "🟢"
+    elif negocios >= 5:
+        liquidez_texto = "Moderada"
+        liquidez_icone = "🟡"
+    else:
+        liquidez_texto = "Baixa"
+        liquidez_icone = "🟠"
 
+    if chance_implicita < 25:
+        chance_texto = "Baixa"
+        chance_icone = "🟢"
+    elif chance_implicita < 50:
+        chance_texto = "Moderada"
+        chance_icone = "🟡"
+    else:
+        chance_texto = "Alta"
+        chance_icone = "🔴"
+
+    if diagnostico == "Muito boa":
+        destaque = "🟢 MUITO BOA OPORTUNIDADE"
+    elif diagnostico == "Boa":
+        destaque = "🟡 BOA OPORTUNIDADE"
+    elif diagnostico == "Regular":
+        destaque = "🟠 OPORTUNIDADE REGULAR"
+    else:
+        destaque = "🔴 OPORTUNIDADE FRACA"
+
+    st.markdown(f"## {tipo} · Parecer da oportunidade")
+    st.markdown(f"### {destaque}")
+
+    q1, q2 = st.columns([1, 2])
+    with q1:
+        st.metric("Qualidade", f"{qualidade:.0f}/100")
+    with q2:
+        st.progress(int(qualidade))
+        st.caption(
+            "A qualidade combina prêmio, liquidez e distância do strike."
+        )
+
+    st.divider()
+
+    if tipo == "CALL":
+        distancia_exercicio = max(distancia, 0)
+        valor_exercicio = float(op.get("venda_efetiva_call", strike + (premio_total / 100)) or 0)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Você recebe hoje", fmt_rs(premio_total))
+        c2.metric("Se for exercido, receberá", fmt_rs(valor_exercicio), help="Strike + prêmio recebido por ação.")
+        c3.metric("Chance implícita de ser exercido", f"{chance_implicita:.0f}%", delta=chance_texto, delta_color="off")
+        c4.metric("Liquidez", f"{liquidez_icone} {liquidez_texto}", help=f"{negocios} negócios no último pregão.")
+
+        st.markdown(
+            f"""
+            <div style="padding:22px;border-radius:14px;background:#f5f7fb;margin:14px 0 18px 0;text-align:center;">
+                <div style="font-size:16px;color:#5f6b7a;">📈 Para ocorrer o exercício</div>
+                <div style="font-size:22px;font-weight:600;margin-top:5px;">{ativo} precisa subir</div>
+                <div style="font-size:44px;font-weight:800;line-height:1.15;">{distancia_exercicio:.2f}%</div>
+                <div style="font-size:17px;color:#5f6b7a;">até {data_vencimento}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        pontos_positivos = []
+        pontos_atencao = []
+
+        if distancia_exercicio >= 4:
+            pontos_positivos.append(f"O strike está {distancia_exercicio:.2f}% acima da cotação atual.")
+        elif distancia_exercicio >= 2:
+            pontos_positivos.append(f"Existe uma margem de {distancia_exercicio:.2f}% até o strike.")
+        else:
+            pontos_atencao.append(f"O strike está próximo: apenas {distancia_exercicio:.2f}% acima da cotação.")
+
+        if chance_implicita < 35:
+            pontos_positivos.append(f"A chance implícita indicada pelo Delta é de aproximadamente {chance_implicita:.0f}%.")
+        else:
+            pontos_atencao.append(f"A chance implícita indicada pelo Delta é de aproximadamente {chance_implicita:.0f}%.")
+
+        if negocios >= 5:
+            pontos_positivos.append(f"A opção registrou {negocios} negócios no último pregão.")
+        else:
+            pontos_atencao.append(f"Liquidez baixa: apenas {negocios} negócio(s) no último pregão.")
+
+        parecer = (
+            f"Esta CALL paga {fmt_rs(premio_total)} por lote e permite uma venda efetiva "
+            f"aproximada de {fmt_rs(valor_exercicio)} por ação. "
+            f"Para haver exercício, {ativo} precisa subir {distancia_exercicio:.2f}% até {data_vencimento}. "
+            f"A operação faz sentido somente se você ficar satisfeito em vender suas ações por esse valor."
+        )
+
+    else:
+        distancia_exercicio = abs(min(distancia, 0)) if distancia < 0 else distancia
+        valor_exercicio = float(op.get("preco_efetivo_put", strike - (premio_total / 100)) or 0)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Você recebe hoje", fmt_rs(premio_total))
+        c2.metric("Se for exercido, comprará por", fmt_rs(valor_exercicio), help="Strike menos o prêmio recebido por ação.")
+        c3.metric("Chance implícita de ser exercido", f"{chance_implicita:.0f}%", delta=chance_texto, delta_color="off")
+        c4.metric("Liquidez", f"{liquidez_icone} {liquidez_texto}", help=f"{negocios} negócios no último pregão.")
+
+        movimento = abs(distancia)
+        st.markdown(
+            f"""
+            <div style="padding:22px;border-radius:14px;background:#f5f7fb;margin:14px 0 18px 0;text-align:center;">
+                <div style="font-size:16px;color:#5f6b7a;">📉 Para ocorrer o exercício</div>
+                <div style="font-size:22px;font-weight:600;margin-top:5px;">{ativo} precisa chegar ao strike</div>
+                <div style="font-size:44px;font-weight:800;line-height:1.15;">{movimento:.2f}% de distância</div>
+                <div style="font-size:17px;color:#5f6b7a;">até {data_vencimento}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        pontos_positivos = []
+        pontos_atencao = []
+
+        if chance_implicita < 35:
+            pontos_positivos.append(f"A chance implícita indicada pelo Delta é de aproximadamente {chance_implicita:.0f}%.")
+        else:
+            pontos_atencao.append(f"A chance implícita indicada pelo Delta é de aproximadamente {chance_implicita:.0f}%.")
+
+        if negocios >= 5:
+            pontos_positivos.append(f"A opção registrou {negocios} negócios no último pregão.")
+        else:
+            pontos_atencao.append(f"Liquidez baixa: apenas {negocios} negócio(s) no último pregão.")
+
+        pontos_positivos.append(f"O custo líquido, em caso de exercício, seria aproximadamente {fmt_rs(valor_exercicio)} por ação.")
+
+        parecer = (
+            f"Esta PUT paga {fmt_rs(premio_total)} por lote e pode resultar na compra de {ativo} "
+            f"por um custo líquido aproximado de {fmt_rs(valor_exercicio)} por ação. "
+            f"A operação faz sentido somente se você realmente desejar comprar o ativo por esse valor."
+        )
+
+    p1, p2 = st.columns(2)
+    with p1:
+        st.markdown("#### Pontos positivos")
+        if pontos_positivos:
+            for item in pontos_positivos:
+                st.write(f"✅ {item}")
+        else:
+            st.caption("Nenhum ponto positivo relevante identificado.")
+
+    with p2:
+        st.markdown("#### Pontos de atenção")
+        if pontos_atencao:
+            for item in pontos_atencao:
+                st.write(f"⚠️ {item}")
+        else:
+            st.write("✅ Nenhum alerta relevante identificado.")
+
+    st.markdown("#### Parecer")
+    st.info(parecer)
+
+    with st.expander("Ver detalhes técnicos"):
+        t1, t2, t3, t4, t5 = st.columns(5)
+        t1.metric("Ativo", ativo)
+        t2.metric("Código", codigo)
+        t3.metric("Cotação atual", fmt_rs(cotacao))
+        t4.metric("Strike", fmt_rs(strike))
+        t5.metric("Delta", f"{delta:.3f}".replace(".", ","))
+
+        t6, t7, t8, t9 = st.columns(4)
+        t6.metric("Situação técnica", str(op.get("situacao", "")))
+        t7.metric("Distância do strike", f"{distancia:.2f}%".replace(".", ","))
+        t8.metric("Negócios", negocios)
+        t9.metric("Diagnóstico interno", diagnostico)
 
 
 def render_velocimetro(percentual):
@@ -602,17 +797,8 @@ with aba_oportunidades:
         if df.empty:
             st.warning("Nenhuma opção encontrada para esse vencimento.")
         else:
-            calls_todas = df[df["tipo"] == "CALL"].sort_values(
-                ["ativo", "score_total"], ascending=[True, False]
-            )
-            puts_todas = df[df["tipo"] == "PUT"].sort_values(
-                ["ativo", "score_total"], ascending=[True, False]
-            )
-
-            # Exibe até 3 opções de cada empresa, evitando que um único ativo
-            # ocupe todo o ranking.
-            calls = calls_todas.groupby("ativo", group_keys=False).head(3)
-            puts = puts_todas.groupby("ativo", group_keys=False).head(3)
+            calls = df[df["tipo"] == "CALL"].sort_values("score_total", ascending=False).head(5)
+            puts = df[df["tipo"] == "PUT"].sort_values("score_total", ascending=False).head(5)
             col_call, col_put = st.columns(2)
 
             with col_call:
@@ -625,7 +811,7 @@ with aba_oportunidades:
                         "ativo", "codigo", "mes", "strike", "ultimo", "premio_total",
                         "cotacao_atual", "distancia_pct", "delta", "negocios", "diagnostico"
                     ]], use_container_width=True, hide_index=True)
-                    cod_call = st.selectbox("Selecionar CALL", calls_todas["codigo"], key="sel_call")
+                    cod_call = st.selectbox("Selecionar CALL", calls["codigo"], key="sel_call")
 
             with col_put:
                 st.subheader("🟢 Top PUTs hoje")
@@ -637,7 +823,7 @@ with aba_oportunidades:
                         "ativo", "codigo", "mes", "strike", "ultimo", "premio_total",
                         "preco_efetivo_put", "distancia_pct", "delta", "negocios", "diagnostico"
                     ]], use_container_width=True, hide_index=True)
-                    cod_put = st.selectbox("Selecionar PUT", puts_todas["codigo"], key="sel_put")
+                    cod_put = st.selectbox("Selecionar PUT", puts["codigo"], key="sel_put")
 
             st.divider()
             diag_call, diag_put = st.columns(2)
