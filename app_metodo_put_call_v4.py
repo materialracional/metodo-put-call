@@ -111,14 +111,18 @@ def criar_driver():
     )
 
 def extrair_tabela_visivel(driver, ativo, tipo):
-    """Extrai a grade atual do Opções.Net.Br.
-
-    A página atual não traz uma coluna de tipo dentro da tabela; CALL/PUT é
-    definido pelo seletor acima da grade. Por isso o tipo é recebido como
-    argumento e gravado em todas as linhas extraídas.
     """
+    Extrai a grade atual do Opções.Net.Br.
+
+    A página atual não traz uma coluna de tipo dentro da tabela;
+    CALL/PUT é definido pelo seletor acima da grade. Por isso o
+    tipo é recebido como argumento e gravado em todas as linhas.
+    """
+
     linhas = []
+
     for tabela in driver.find_elements(By.TAG_NAME, "table"):
+
         try:
             if not tabela.is_displayed():
                 continue
@@ -126,48 +130,64 @@ def extrair_tabela_visivel(driver, ativo, tipo):
             continue
 
         for row in tabela.find_elements(By.TAG_NAME, "tr"):
+
             cols = row.find_elements(By.TAG_NAME, "td")
             dados = [c.text.strip() for c in cols]
-            # A grade atual tem pelo menos 17 colunas úteis; algumas telas
-            # incluem IQ/Cobertura como colunas adicionais.
-           if dados:
-    		print("=" * 80)
-    		print(f"DEBUG {ativo}")
-   		print(f"Quantidade de colunas: {len(dados)}")
-    		print(dados)
+
+            if dados:
+                print("=" * 80)
+                print(f"DEBUG {ativo}")
+                print(f"Quantidade de colunas: {len(dados)}")
+                print(dados)
+
+                linhas.append(dados)
 
     colunas_finais = [
-        "ativo", "codigo", "tipo", "estilo", "strike", "situacao",
-        "distancia_pct", "ultimo", "variacao_pct", "data_ultimo_negocio",
-        "negocios", "volume", "volatilidade", "delta", "gamma", "theta",
-        "vega", "lambda"
+        "ativo",
+        "codigo",
+        "tipo",
+        "estilo",
+        "strike",
+        "situacao",
+        "distancia_pct",
+        "ultimo",
+        "variacao_pct",
+        "data_ultimo_negocio",
+        "negocios",
+        "volume",
+        "volatilidade",
+        "delta",
+        "gamma",
+        "theta",
+        "vega",
+        "lambda",
     ]
 
     if not linhas:
         return pd.DataFrame(columns=colunas_finais)
 
-    # Completa linhas menores para permitir a criação uniforme do DataFrame.
+    # Descobre automaticamente a maior linha encontrada
     largura = max(len(x) for x in linhas)
-    linhas = [x + [""] * (largura - len(x)) for x in linhas]
-    df = pd.DataFrame(linhas)
-    df = df.rename(columns=COLUNAS)
 
-    # Campos que podem não existir na grade atual.
-    if "vega" not in df.columns:
-        df["vega"] = ""
-    if "iq" not in df.columns:
-        df["iq"] = ""
+    # Completa as menores
+    linhas = [x + [""] * (largura - len(x)) for x in linhas]
+
+    df = pd.DataFrame(linhas)
+
+    # Renomeia somente as colunas conhecidas
+    for i, nome in COLUNAS.items():
+        if i < len(df.columns):
+            df.rename(columns={i: nome}, inplace=True)
+
+    # Garante que existam todas as colunas
+    for c in colunas_finais:
+        if c not in df.columns:
+            df[c] = ""
 
     df["ativo"] = ativo
     df["tipo"] = tipo
-    df["lambda"] = df.get("iq", "")
-
-    # Mantém apenas linhas que parecem códigos de opção do ativo.
-    df["codigo"] = df["codigo"].astype(str).str.upper().str.strip()
-    df = df[df["codigo"].str.len() >= 6]
 
     return df[colunas_finais]
-
 
 def selecionar_tipo(driver, tipo):
     alvo = "CALLs" if tipo == "CALL" else "PUTs"
