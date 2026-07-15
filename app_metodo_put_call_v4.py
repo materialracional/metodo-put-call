@@ -130,8 +130,11 @@ def extrair_tabela_visivel(driver, ativo, tipo):
             dados = [c.text.strip() for c in cols]
             # A grade atual tem pelo menos 17 colunas úteis; algumas telas
             # incluem IQ/Cobertura como colunas adicionais.
-            if dados and len(dados) >= 17 and dados[0]:
-                linhas.append(dados[:18])
+           if dados:
+    		print("=" * 80)
+    		print(f"DEBUG {ativo}")
+   		print(f"Quantidade de colunas: {len(dados)}")
+    		print(dados)
 
     colunas_finais = [
         "ativo", "codigo", "tipo", "estilo", "strike", "situacao",
