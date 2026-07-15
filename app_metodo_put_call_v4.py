@@ -213,37 +213,30 @@ def selecionar_vencimento(driver, vencimento_texto):
 
     try:
         for label in driver.find_elements(By.XPATH, "//label"):
-            if vencimento_texto in label.text.strip():
-                try:
-                    checkbox = label.find_element(By.XPATH, ".//input[@type='checkbox']")
-                    if not checkbox.is_selected():
-                        driver.execute_script("arguments[0].click();", checkbox)
-                    time.sleep(2)
-                    return True
-                except Exception:
-                    driver.execute_script("arguments[0].click();", label)
-                    time.sleep(2)
-                    return True
-    except Exception:
-        pass
+            texto_label = label.text.strip()
 
-    try:
-        elementos = driver.find_elements(
-            By.XPATH, f"//*[contains(normalize-space(text()), '{vencimento_texto}')]"
+            if vencimento_texto in texto_label:
+                checkbox = label.find_element(
+                    By.XPATH,
+                    ".//input[@type='checkbox']"
+                )
+
+                if not checkbox.is_selected():
+                    driver.execute_script(
+                        "arguments[0].click();",
+                        checkbox
+                    )
+                    time.sleep(4)
+
+                return True
+
+    except Exception as e:
+        print(
+            f"Erro ao selecionar vencimento "
+            f"{vencimento_texto}: {e}"
         )
-        for el in elementos:
-            try:
-                if el.is_displayed():
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
-                    driver.execute_script("arguments[0].click();", el)
-                    time.sleep(2)
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return False
 
+    return False
 
 def aceitar_dados_fechamento(driver):
     textos = [
