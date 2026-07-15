@@ -495,8 +495,11 @@ def card_diagnostico(op, tipo):
         parecer = (
             f"Esta CALL paga {fmt_rs(premio_total)} por lote e permite uma venda efetiva "
             f"aproximada de {fmt_rs(valor_exercicio)} por ação. "
-            f"Para haver exercício, {ativo} precisa subir {distancia_exercicio:.2f}% até {data_vencimento}. "
-            f"A operação faz sentido somente se você ficar satisfeito em vender suas ações por esse valor."
+            f"Para haver exercício, {ativo} precisa subir {distancia_exercicio:.2f}% até {data_vencimento}."
+        )
+        reflexao = (
+            f"Você ficaria satisfeito em vender suas ações de {ativo} por "
+            f"aproximadamente {fmt_rs(valor_exercicio)} por ação?"
         )
 
     else:
@@ -539,8 +542,11 @@ def card_diagnostico(op, tipo):
 
         parecer = (
             f"Esta PUT paga {fmt_rs(premio_total)} por lote e pode resultar na compra de {ativo} "
-            f"por um custo líquido aproximado de {fmt_rs(valor_exercicio)} por ação. "
-            f"A operação faz sentido somente se você realmente desejar comprar o ativo por esse valor."
+            f"por um custo líquido aproximado de {fmt_rs(valor_exercicio)} por ação."
+        )
+        reflexao = (
+            f"Você ficaria satisfeito em comprar {ativo} por aproximadamente "
+            f"{fmt_rs(valor_exercicio)} por ação?"
         )
 
     p1, p2 = st.columns(2)
@@ -562,6 +568,9 @@ def card_diagnostico(op, tipo):
 
     st.markdown("#### Parecer")
     st.info(parecer)
+
+    st.markdown("#### Antes de decidir")
+    st.warning(reflexao)
 
     with st.expander("Ver detalhes técnicos"):
         t1, t2, t3, t4, t5 = st.columns(5)
