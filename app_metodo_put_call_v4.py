@@ -803,6 +803,29 @@ with aba_oportunidades:
         if df.empty:
             st.warning("Nenhuma opção encontrada para esse vencimento.")
         else:
+            empresas_disponiveis = sorted(df["ativo"].dropna().astype(str).unique().tolist())
+            empresa_visualizada = st.selectbox(
+                "Empresa para visualizar:",
+                ["Todas"] + empresas_disponiveis,
+                key="empresa_visualizada_oportunidades",
+                help="A troca de empresa apenas filtra os dados já coletados; não faz uma nova busca.",
+            )
+
+            if empresa_visualizada == "Todas":
+                df_visual = df.copy()
+                st.caption(
+                    f"Exibindo todas as empresas coletadas: "
+                    f"{len(df_visual[df_visual['tipo'] == 'CALL'])} CALLs e "
+                    f"{len(df_visual[df_visual['tipo'] == 'PUT'])} PUTs."
+                )
+            else:
+                df_visual = df[df["ativo"] == empresa_visualizada].copy()
+                st.caption(
+                    f"{empresa_visualizada}: "
+                    f"{len(df_visual[df_visual['tipo'] == 'CALL'])} CALLs e "
+                    f"{len(df_visual[df_visual['tipo'] == 'PUT'])} PUTs encontradas."
+                )
+
             st.markdown("### Comparar oportunidades")
             criterio_ordem = st.selectbox(
                 "Ordenar opções por:",
@@ -816,8 +839,8 @@ with aba_oportunidades:
                 key="criterio_ordenacao_oportunidades",
             )
 
-            calls_todas = df[df["tipo"] == "CALL"].copy()
-            puts_todas = df[df["tipo"] == "PUT"].copy()
+            calls_todas = df_visual[df_visual["tipo"] == "CALL"].copy()
+            puts_todas = df_visual[df_visual["tipo"] == "PUT"].copy()
 
             if criterio_ordem == "Maior retorno":
                 calls_todas = calls_todas.sort_values("retorno_pct", ascending=False)
@@ -887,10 +910,10 @@ with aba_oportunidades:
             diag_call, diag_put = st.columns(2)
             with diag_call:
                 if cod_call:
-                    card_diagnostico(df[df["codigo"] == cod_call].iloc[0], "CALL")
+                    card_diagnostico(df_visual[df_visual["codigo"] == cod_call].iloc[0], "CALL")
             with diag_put:
                 if cod_put:
-                    card_diagnostico(df[df["codigo"] == cod_put].iloc[0], "PUT")
+                    card_diagnostico(df_visual[df_visual["codigo"] == cod_put].iloc[0], "PUT")
 
 with aba_operacoes:
     st.subheader("📒 Cadastro e acompanhamento")
