@@ -80,6 +80,14 @@ def fmt_pct(x):
         return "0,0%"
 
 
+def normalizar_codigo(codigo):
+    """Padroniza tickers e remove espaços/caracteres invisíveis."""
+    return "".join(
+        caractere for caractere in str(codigo).upper().strip()
+        if caractere.isalnum()
+    )
+
+
 def mes_opcao(codigo):
     try:
         letra = str(codigo).strip().upper()[4]
@@ -348,7 +356,7 @@ def preparar(df):
     ]:
         df[col] = df[col].apply(moeda_para_float)
 
-    df["codigo"] = df["codigo"].astype(str).str.upper().str.strip()
+    df["codigo"] = df["codigo"].apply(normalizar_codigo)
     df["tipo"] = df["tipo"].astype(str).str.upper().str.strip()
     df["mes"] = df["codigo"].apply(mes_opcao)
     df["premio_total"] = df["ultimo"] * 100
@@ -707,7 +715,9 @@ def cotacao_mercado_codigo(codigo):
     dados = st.session_state.get("dados")
     if dados is None or dados.empty:
         return None
-    achado = dados[dados["codigo"].astype(str).str.upper() == str(codigo).upper()]
+    codigo_procurado = normalizar_codigo(codigo)
+    codigos_mercado = dados["codigo"].apply(normalizar_codigo)
+    achado = dados[codigos_mercado == codigo_procurado]
     if achado.empty:
         return None
     return float(achado.iloc[0]["ultimo"])
@@ -727,13 +737,22 @@ def enriquecer_operacoes(df):
         return automatico if automatico is not None else float(row["cotacao_atual_manual"])
 
     resultado["cotacao_atual"] = resultado.apply(preco_atual, axis=1)
+    resultado["cotacao_disponivel"] = resultado["cotacao_atual"] > 0
     resultado["valor_recebido"] = resultado["premio_recebido"] * resultado["quantidade"]
-    resultado["custo_encerramento"] = resultado["cotacao_atual"] * resultado["quantidade"]
-    resultado["resultado_atual"] = resultado["valor_recebido"] - resultado["custo_encerramento"]
+    resultado["custo_encerramento"] = resultado.apply(
+        lambda r: r["cotacao_atual"] * r["quantidade"]
+        if r["cotacao_disponivel"] else pd.NA,
+        axis=1,
+    )
+    resultado["resultado_atual"] = resultado.apply(
+        lambda r: r["valor_recebido"] - r["custo_encerramento"]
+        if r["cotacao_disponivel"] else pd.NA,
+        axis=1,
+    )
     resultado["capital_referencia"] = resultado["strike"] * resultado["quantidade"]
     resultado["rentabilidade_atual_pct"] = resultado.apply(
         lambda r: (r["resultado_atual"] / r["capital_referencia"] * 100)
-        if r["capital_referencia"] > 0 else 0,
+        if r["cotacao_disponivel"] and r["capital_referencia"] > 0 else pd.NA,
         axis=1
     )
     resultado["rentabilidade_maxima_pct"] = resultado.apply(
@@ -742,7 +761,8 @@ def enriquecer_operacoes(df):
         axis=1
     )
     resultado["premio_capturado_pct"] = resultado.apply(
-        lambda r: (r["resultado_atual"] / r["valor_recebido"] * 100) if r["valor_recebido"] > 0 else 0,
+        lambda r: (r["resultado_atual"] / r["valor_recebido"] * 100)
+        if r["cotacao_disponivel"] and r["valor_recebido"] > 0 else pd.NA,
         axis=1
     )
 
@@ -756,10 +776,10 @@ def enriquecer_operacoes(df):
     resultado["dias_restantes"] = resultado["vencimento"].apply(dias_restantes)
 
     def diagnostico_saida(row):
-        pct = row["premio_capturado_pct"]
+        if not row["cotacao_disponivel"]:
+            return "⚪ Cotação não encontrada — informe ou atualize"
+        pct = float(row["premio_capturado_pct"])
         dias = row["dias_restantes"]
-        if row["cotacao_atual"] <= 0:
-            return "⚪ Informe/atualize a cotação"
         if pct >= 90:
             return "🟢 Avaliar encerramento: ≥ 90% capturado"
         if pct >= 80:
@@ -1077,10 +1097,13 @@ with aba_operacoes:
         operacoes_calc = enriquecer_operacoes(abertas)
 
         total_recebido = operacoes_calc["valor_recebido"].sum()
-        resultado_total = operacoes_calc["resultado_atual"].sum()
-        premio_pct_total = (resultado_total / total_recebido * 100) if total_recebido > 0 else 0
+        operacoes_cotadas = operacoes_calc[operacoes_calc["cotacao_disponivel"]].copy()
+        operacoes_sem_cotacao = len(operacoes_calc) - len(operacoes_cotadas)
+        resultado_total = operacoes_cotadas["resultado_atual"].sum()
+        premio_cotado = operacoes_cotadas["valor_recebido"].sum()
+        premio_pct_total = (resultado_total / premio_cotado * 100) if premio_cotado > 0 else 0
 
-        capital_total = operacoes_calc["capital_referencia"].sum()
+        capital_total = operacoes_cotadas["capital_referencia"].sum()
         rentabilidade_total = (resultado_total / capital_total * 100) if capital_total > 0 else 0
 
         m1, m2, m3, m4, m5 = st.columns(5)
@@ -1091,6 +1114,12 @@ with aba_operacoes:
         m5.metric("Rentabilidade atual", fmt_pct(rentabilidade_total),
                   help="Resultado atual dividido pelo capital de referência (strike × quantidade).")
 
+        if operacoes_sem_cotacao:
+            st.warning(
+                f"{operacoes_sem_cotacao} operação(ões) está(ão) sem cotação válida e não foi(ram) "
+                "incluída(s) no resultado, no prêmio capturado e na rentabilidade atual."
+            )
+
         st.divider()
         for _, op in operacoes_calc.iterrows():
             with st.container(border=True):
@@ -1100,15 +1129,24 @@ with aba_operacoes:
                 c1, c2, c3, c4, c5, c6 = st.columns(6)
                 c1.metric("Strike", fmt_rs(op["strike"]))
                 c2.metric("Prêmio recebido", fmt_rs(op["premio_recebido"]))
-                c3.metric("Cotação atual", fmt_rs(op["cotacao_atual"]))
-                c4.metric("Resultado", fmt_rs(op["resultado_atual"]))
-                c5.metric("Prêmio capturado", fmt_pct(op["premio_capturado_pct"]))
+                c3.metric(
+                    "Cotação atual",
+                    fmt_rs(op["cotacao_atual"]) if op["cotacao_disponivel"] else "Não encontrada",
+                )
+                c4.metric(
+                    "Resultado",
+                    fmt_rs(op["resultado_atual"]) if op["cotacao_disponivel"] else "Não disponível",
+                )
+                c5.metric(
+                    "Prêmio capturado",
+                    fmt_pct(op["premio_capturado_pct"]) if op["cotacao_disponivel"] else "Não disponível",
+                )
                 c6.metric("Dias restantes", int(op["dias_restantes"]))
 
                 r1, r2, r3 = st.columns(3)
                 r1.metric(
                     "Rentabilidade atual",
-                    fmt_pct(op["rentabilidade_atual_pct"]),
+                    fmt_pct(op["rentabilidade_atual_pct"]) if op["cotacao_disponivel"] else "Não disponível",
                     help="Resultado atual ÷ (strike × quantidade)."
                 )
                 r2.metric(
@@ -1120,13 +1158,19 @@ with aba_operacoes:
 
                 gauge_col, diag_col = st.columns([1, 2])
                 with gauge_col:
-                    render_velocimetro(op["premio_capturado_pct"])
+                    if op["cotacao_disponivel"]:
+                        render_velocimetro(op["premio_capturado_pct"])
+                    else:
+                        st.info("O velocímetro será exibido quando houver uma cotação válida.")
                 with diag_col:
                     lucro_maximo = op["valor_recebido"]
-                    premio_restante = max(lucro_maximo - op["resultado_atual"], 0)
                     d1, d2 = st.columns(2)
                     d1.metric("Lucro máximo possível", fmt_rs(lucro_maximo))
-                    d2.metric("Prêmio ainda em aberto", fmt_rs(premio_restante))
+                    if op["cotacao_disponivel"]:
+                        premio_restante = max(lucro_maximo - op["resultado_atual"], 0)
+                        d2.metric("Prêmio ainda em aberto", fmt_rs(premio_restante))
+                    else:
+                        d2.metric("Prêmio ainda em aberto", "Não disponível")
                     st.write(f"**Diagnóstico:** {op['sinal']}")
 
                 if pd.notna(op["observacao"]) and str(op["observacao"]).strip() not in ("", "nan"):
