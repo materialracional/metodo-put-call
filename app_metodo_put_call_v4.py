@@ -723,6 +723,35 @@ def cotacao_mercado_codigo(codigo):
     return float(achado.iloc[0]["ultimo"])
 
 
+def cotacao_mercado_operacao(row):
+    """Localiza a opção por código e usa ativo/tipo/strike como contingência."""
+    automatico = cotacao_mercado_codigo(row["codigo"])
+    if automatico is not None and automatico > 0:
+        return automatico
+
+    dados = st.session_state.get("dados")
+    if dados is None or dados.empty:
+        return None
+
+    ativo_procurado = normalizar_codigo(row["ativo_base"])
+    tipo_procurado = str(row["tipo"]).upper().strip()
+    strike_procurado = float(row["strike"])
+
+    candidatos = dados.copy()
+    candidatos = candidatos[
+        (candidatos["ativo"].apply(normalizar_codigo) == ativo_procurado)
+        & (candidatos["tipo"].astype(str).str.upper().str.strip() == tipo_procurado)
+        & ((pd.to_numeric(candidatos["strike"], errors="coerce") - strike_procurado).abs() < 0.005)
+    ]
+
+    # Evita escolher silenciosamente se houver mais de uma opção no mesmo strike.
+    if len(candidatos) != 1:
+        return None
+
+    cotacao = float(candidatos.iloc[0]["ultimo"])
+    return cotacao if cotacao > 0 else None
+
+
 def enriquecer_operacoes(df):
     if df.empty:
         return df.copy()
@@ -733,7 +762,7 @@ def enriquecer_operacoes(df):
         resultado[col] = pd.to_numeric(resultado[col], errors="coerce").fillna(0)
 
     def preco_atual(row):
-        automatico = cotacao_mercado_codigo(row["codigo"])
+        automatico = cotacao_mercado_operacao(row)
         return automatico if automatico is not None else float(row["cotacao_atual_manual"])
 
     resultado["cotacao_atual"] = resultado.apply(preco_atual, axis=1)
