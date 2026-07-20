@@ -961,35 +961,48 @@ with aba_oportunidades:
                     cod_call = st.selectbox("Selecionar CALL para o Parecer", opcoes_call, key="sel_call")
 
             with col_put:
-                st.subheader("🟢 PUTs")
                 objetivo_put = "Gerar renda"
                 if puts.empty:
+                    st.subheader("🟢 PUTs")
                     st.warning("Nenhuma PUT encontrada.")
                     cod_put = None
                 else:
+                    opcoes_put = puts_todas.sort_values(["ativo", "strike"])["codigo"].drop_duplicates().tolist()
+                    codigo_put_atual = st.session_state.get("sel_put", opcoes_put[0])
+                    if codigo_put_atual not in opcoes_put:
+                        codigo_put_atual = opcoes_put[0]
+                    put_referencia = puts_todas[puts_todas["codigo"] == codigo_put_atual].iloc[0]
+
+                    st.markdown(
+                        f"""
+                        <div style="display:flex;align-items:center;justify-content:space-between;
+                                    gap:12px;margin:0 0 12px 0;flex-wrap:nowrap;">
+                            <div style="font-size:1.75rem;font-weight:700;white-space:nowrap;">
+                                🟢 PUTs
+                            </div>
+                            <div style="font-size:1.15rem;font-weight:700;color:#344054;
+                                        text-align:right;white-space:nowrap;">
+                                {str(put_referencia['ativo']).upper()} · {fmt_rs(put_referencia['cotacao_atual'])}
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
                     st.dataframe(
                         puts[["ativo", "codigo", "Retorno", "Custo efetivo", "Distância do strike", "Chance implícita"]],
                         use_container_width=True,
                         hide_index=True,
                     )
-                    opcoes_put = puts_todas.sort_values(["ativo", "strike"])["codigo"].drop_duplicates().tolist()
                     cod_put = st.selectbox("Selecionar PUT para o Parecer", opcoes_put, key="sel_put")
 
-                    put_selecionada = puts_todas[puts_todas["codigo"] == cod_put].iloc[0]
-                    objetivo_col, cotacao_col = st.columns([2, 1])
-                    with objetivo_col:
-                        objetivo_put = st.radio(
-                            "Intenção da PUT",
-                            ["Gerar renda", "Comprar a ação"],
-                            horizontal=True,
-                            key="objetivo_put_oportunidades",
-                            help="A escolha altera somente a interpretação do parecer.",
-                        )
-                    with cotacao_col:
-                        st.metric(
-                            f"Cotação {str(put_selecionada['ativo']).upper()}",
-                            fmt_rs(put_selecionada["cotacao_atual"]),
-                        )
+                    objetivo_put = st.radio(
+                        "Intenção da PUT",
+                        ["Gerar renda", "Comprar a ação"],
+                        horizontal=True,
+                        key="objetivo_put_oportunidades",
+                        help="A escolha altera somente a interpretação do parecer.",
+                    )
 
             st.divider()
             diag_call, diag_put = st.columns(2)
