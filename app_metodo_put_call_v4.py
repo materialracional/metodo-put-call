@@ -421,7 +421,7 @@ def descricao_exercicio_call(distancia):
         return f"Strike já foi ultrapassado em {abs(distancia):.2f}%"
     return "No strike"
 
-def card_diagnostico(op, tipo):
+def card_diagnostico(op, tipo, objetivo_put="Gerar renda"):
     """Exibe o parecer da oportunidade em linguagem prática e objetiva."""
 
     tipo = str(tipo).upper().strip()
@@ -445,12 +445,14 @@ def card_diagnostico(op, tipo):
         else vencimento_carregado or "o vencimento"
     )
 
-    if negocios >= 20:
+    if negocios >= 10:
         liquidez_texto, liquidez_icone = "Boa", "🟢"
-    elif negocios >= 5:
+    elif negocios >= 3:
         liquidez_texto, liquidez_icone = "Moderada", "🟡"
-    else:
+    elif negocios >= 1:
         liquidez_texto, liquidez_icone = "Baixa", "🟠"
+    else:
+        liquidez_texto, liquidez_icone = "Sem negócios observados", "⚪"
 
     st.markdown(
         f"""
@@ -482,8 +484,9 @@ def card_diagnostico(op, tipo):
                   f"{venda_acima_pct:+.2f}% vs. hoje".replace(".", ","))
         c3.metric("Chance implícita de exercício", f"{chance_implicita:.0f}%",
                   f"{chance_icone} {chance_texto}", delta_color="off")
-        c4.metric("Liquidez", f"{liquidez_icone} {liquidez_texto}",
-                  help=f"{negocios} negócios no último pregão.")
+        c4.metric("Negócios no último pregão", f"{negocios}",
+                  f"{liquidez_icone} {liquidez_texto}", delta_color="off",
+                  help="É uma fotografia da negociação recente. Não garante que será possível recomprar a opção futuramente pelo preço desejado.")
 
         if distancia > 0:
             chamada = f"{ativo} precisa subir"
@@ -531,15 +534,32 @@ def card_diagnostico(op, tipo):
     else:
         custo_efetivo = float(op.get("preco_efetivo_put", strike - premio_por_acao) or 0)
         desconto_pct = ((custo_efetivo / cotacao) - 1) * 100 if cotacao > 0 else 0
+        capital_comprometido = strike * 100
+        desembolso_liquido = custo_efetivo * 100
+        retorno_capital_pct = (premio_por_acao / strike * 100) if strike > 0 else 0
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Você recebe hoje", fmt_rs(premio_total), f"{retorno_pct:.2f}%".replace(".", ","))
+        c1.metric(
+            "Você recebe hoje",
+            fmt_rs(premio_total),
+            f"{retorno_capital_pct:.2f}% do capital".replace(".", ","),
+        )
         c2.metric("Se for exercido, comprará por", fmt_rs(custo_efetivo),
                   f"{desconto_pct:+.2f}% vs. hoje".replace(".", ","))
         c3.metric("Chance implícita de exercício", f"{chance_implicita:.0f}%",
                   f"{chance_icone} {chance_texto}", delta_color="off")
-        c4.metric("Liquidez", f"{liquidez_icone} {liquidez_texto}",
-                  help=f"{negocios} negócios no último pregão.")
+        c4.metric(
+            "Negócios no último pregão",
+            f"{negocios}",
+            f"{liquidez_icone} {liquidez_texto}",
+            delta_color="off",
+            help="Ajuda a estimar a facilidade de uma eventual recompra, mas não garante liquidez futura nem execução pelo preço exibido.",
+        )
+
+        f1, f2, f3 = st.columns(3)
+        f1.metric("Capital comprometido (100 ações)", fmt_rs(capital_comprometido))
+        f2.metric("Desembolso líquido se exercido", fmt_rs(desembolso_liquido))
+        f3.metric("Retorno sobre o capital", f"{retorno_capital_pct:.2f}%".replace(".", ","))
 
         movimento = abs(distancia)
         direcao = "cair" if distancia < 0 else "subir"
@@ -556,11 +576,51 @@ def card_diagnostico(op, tipo):
             unsafe_allow_html=True,
         )
 
+        if objetivo_put == "Gerar renda":
+            if chance_implicita <= 40 and distancia < 0:
+                ajuste_objetivo = (
+                    "A combinação de distância abaixo da cotação e chance implícita baixa favorece "
+                    "a intenção de gerar renda sem buscar o exercício."
+                )
+                nivel_objetivo = "Boa adequação para geração de renda."
+            elif chance_implicita <= 60:
+                ajuste_objetivo = (
+                    "A chance de exercício é moderada. O prêmio pode ser interessante, mas existe "
+                    "uma possibilidade relevante de receber as ações."
+                )
+                nivel_objetivo = "Adequação moderada para geração de renda."
+            else:
+                ajuste_objetivo = (
+                    "A chance implícita de exercício é alta para uma operação cujo objetivo principal "
+                    "é renda. Ela só deve ser considerada se você também aceitar comprar as ações."
+                )
+                nivel_objetivo = "Baixa adequação para geração de renda."
+        else:
+            if chance_implicita >= 40:
+                ajuste_objetivo = (
+                    "A chance de exercício é relevante e, por isso, a operação se ajusta à intenção "
+                    "de comprar as ações pelo custo efetivo indicado."
+                )
+                nivel_objetivo = "Boa adequação para compra planejada."
+            elif chance_implicita >= 20:
+                ajuste_objetivo = (
+                    "A compra é possível, mas a chance implícita de exercício ainda é baixa. "
+                    "O prêmio remunera a espera, sem assegurar que as ações serão adquiridas."
+                )
+                nivel_objetivo = "Adequação moderada para compra planejada."
+            else:
+                ajuste_objetivo = (
+                    "A chance implícita de exercício é muito baixa. Embora gere prêmio, esta PUT "
+                    "não se ajusta idealmente à intenção de comprar as ações."
+                )
+                nivel_objetivo = "Baixa adequação para compra planejada."
+
         parecer = (
-            f"Esta PUT paga {fmt_rs(premio_total)} por lote, equivalente a {retorno_pct:.2f}% "
-            f"sobre a cotação atual. Se houver exercício, o custo líquido de compra será "
-            f"{fmt_rs(custo_efetivo)} por ação ({desconto_pct:+.2f}% em relação ao preço de hoje). "
-            f"A chance implícita é {chance_texto.lower()} ({chance_implicita:.0f}%)."
+            f"**{nivel_objetivo}** Esta PUT paga {fmt_rs(premio_total)} por lote, equivalente a "
+            f"{retorno_capital_pct:.2f}% sobre o capital comprometido. Se houver exercício, o custo "
+            f"efetivo será {fmt_rs(custo_efetivo)} por ação ({desconto_pct:+.2f}% em relação ao preço "
+            f"de hoje). A chance implícita é {chance_texto.lower()} ({chance_implicita:.0f}%). "
+            f"{ajuste_objetivo}"
         )
         reflexao = f"Você ficaria satisfeito em comprar {ativo} por {fmt_rs(custo_efetivo)} por ação?"
 
@@ -569,6 +629,14 @@ def card_diagnostico(op, tipo):
 
     st.markdown("#### Antes de decidir")
     st.warning(reflexao)
+
+    if tipo == "PUT":
+        st.warning(
+            f"⚠️ Confirme que há caixa disponível para um eventual exercício. "
+            f"Para 100 ações, reserve {fmt_rs(strike * 100)}. "
+            "A quantidade de negócios observada ajuda a avaliar uma possível saída antecipada, "
+            "mas não garante liquidez futura nem execução pelo preço exibido."
+        )
 
     with st.expander("Ver detalhes técnicos"):
         t1, t2, t3, t4, t5 = st.columns(5)
@@ -894,6 +962,13 @@ with aba_oportunidades:
 
             with col_put:
                 st.subheader("🟢 PUTs")
+                objetivo_put = st.radio(
+                    "Qual é sua intenção com esta PUT?",
+                    ["Gerar renda", "Comprar a ação"],
+                    horizontal=True,
+                    key="objetivo_put_oportunidades",
+                    help="A escolha não altera os dados da opção; altera somente a interpretação do parecer.",
+                )
                 if puts.empty:
                     st.warning("Nenhuma PUT encontrada.")
                     cod_put = None
@@ -913,7 +988,11 @@ with aba_oportunidades:
                     card_diagnostico(df_visual[df_visual["codigo"] == cod_call].iloc[0], "CALL")
             with diag_put:
                 if cod_put:
-                    card_diagnostico(df_visual[df_visual["codigo"] == cod_put].iloc[0], "PUT")
+                    card_diagnostico(
+                        df_visual[df_visual["codigo"] == cod_put].iloc[0],
+                        "PUT",
+                        objetivo_put=objetivo_put,
+                    )
 
 with aba_operacoes:
     st.subheader("📒 Cadastro e acompanhamento")
