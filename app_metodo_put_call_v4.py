@@ -711,6 +711,20 @@ def salvar_operacoes(df):
     df.to_csv(ARQUIVO_OPERACOES, index=False)
 
 
+def vencimento_opcoesnet(data_vencimento):
+    """Converte a data cadastrada no rótulo usado pelo seletor do Opções.Net."""
+    try:
+        data_op = datetime.strptime(str(data_vencimento)[:10], "%Y-%m-%d").date()
+        texto = data_op.strftime("%d/%m")
+    except (TypeError, ValueError):
+        return None
+
+    for rotulo, valor in VENCIMENTOS_OPCOESNET.items():
+        if valor == texto:
+            return rotulo
+    return None
+
+
 def cotacao_mercado_codigo(codigo):
     dados = st.session_state.get("dados")
     if dados is None or dados.empty:
@@ -1123,6 +1137,51 @@ with aba_operacoes:
     if abertas.empty:
         st.info("Nenhuma operação aberta cadastrada.")
     else:
+        if st.button("🔄 Atualizar cotações das operações", type="primary"):
+            grupos = abertas[["ativo_base", "vencimento"]].drop_duplicates().to_dict("records")
+            partes_operacoes = []
+            progresso_ops = st.progress(0)
+            status_ops = st.empty()
+
+            for indice, grupo in enumerate(grupos):
+                ativo_grupo = normalizar_codigo(grupo["ativo_base"])
+                rotulo_vencimento = vencimento_opcoesnet(grupo["vencimento"])
+                status_ops.write(f"Buscando {ativo_grupo} — {grupo['vencimento']}...")
+
+                if rotulo_vencimento is None:
+                    st.warning(
+                        f"O vencimento {grupo['vencimento']} de {ativo_grupo} ainda não está "
+                        "configurado na lista de vencimentos do app."
+                    )
+                else:
+                    try:
+                        parte = coletar_opcoes(ativo_grupo, rotulo_vencimento)
+                        if not parte.empty:
+                            parte = preparar(parte)
+                            mes_nome = rotulo_vencimento.split(" - ")[0]
+                            parte = parte[parte["mes"] == mes_nome]
+                            partes_operacoes.append(parte)
+                        else:
+                            st.warning(f"Nenhuma opção encontrada para {ativo_grupo}.")
+                    except Exception as erro:
+                        st.warning(f"Erro ao buscar {ativo_grupo}: {erro}")
+
+                progresso_ops.progress((indice + 1) / max(len(grupos), 1))
+
+            status_ops.empty()
+            if partes_operacoes:
+                novos_dados = pd.concat(partes_operacoes, ignore_index=True)
+                dados_anteriores = st.session_state.get("dados")
+                if dados_anteriores is not None and not dados_anteriores.empty:
+                    novos_dados = pd.concat([dados_anteriores, novos_dados], ignore_index=True)
+                st.session_state.dados = novos_dados.drop_duplicates(
+                    subset=["ativo", "codigo", "tipo"], keep="last"
+                )
+                st.success("Cotações das operações atualizadas.")
+                st.rerun()
+            else:
+                st.error("Não foi possível atualizar as cotações das operações.")
+
         operacoes_calc = enriquecer_operacoes(abertas)
 
         total_recebido = operacoes_calc["valor_recebido"].sum()
