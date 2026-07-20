@@ -962,13 +962,7 @@ with aba_oportunidades:
 
             with col_put:
                 st.subheader("🟢 PUTs")
-                objetivo_put = st.radio(
-                    "Qual é sua intenção com esta PUT?",
-                    ["Gerar renda", "Comprar a ação"],
-                    horizontal=True,
-                    key="objetivo_put_oportunidades",
-                    help="A escolha não altera os dados da opção; altera somente a interpretação do parecer.",
-                )
+                objetivo_put = "Gerar renda"
                 if puts.empty:
                     st.warning("Nenhuma PUT encontrada.")
                     cod_put = None
@@ -980,6 +974,22 @@ with aba_oportunidades:
                     )
                     opcoes_put = puts_todas.sort_values(["ativo", "strike"])["codigo"].drop_duplicates().tolist()
                     cod_put = st.selectbox("Selecionar PUT para o Parecer", opcoes_put, key="sel_put")
+
+                    put_selecionada = puts_todas[puts_todas["codigo"] == cod_put].iloc[0]
+                    objetivo_col, cotacao_col = st.columns([2, 1])
+                    with objetivo_col:
+                        objetivo_put = st.radio(
+                            "Intenção da PUT",
+                            ["Gerar renda", "Comprar a ação"],
+                            horizontal=True,
+                            key="objetivo_put_oportunidades",
+                            help="A escolha altera somente a interpretação do parecer.",
+                        )
+                    with cotacao_col:
+                        st.metric(
+                            f"Cotação {str(put_selecionada['ativo']).upper()}",
+                            fmt_rs(put_selecionada["cotacao_atual"]),
+                        )
 
             st.divider()
             diag_call, diag_put = st.columns(2)
