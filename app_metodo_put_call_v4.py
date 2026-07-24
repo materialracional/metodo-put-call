@@ -207,6 +207,23 @@ def extrair_tabela_visivel(driver, ativo, tipo):
     """
 
     registros = []
+    mapa_18 = COLUNAS
+    mapa_20 = {
+        0: "codigo", 1: "vencimento_opcao", 2: "dias_uteis",
+        3: "check", 4: "estilo", 5: "strike", 6: "situacao",
+        7: "distancia_pct", 8: "ultimo", 9: "variacao_pct",
+        10: "data_ultimo_negocio", 11: "negocios", 12: "volume",
+        13: "volatilidade", 14: "delta", 15: "gamma", 16: "theta",
+        17: "theta_pct", 18: "vega", 19: "iq",
+    }
+    mapa_21 = {
+        0: "codigo", 2: "vencimento_opcao", 3: "dias_uteis",
+        4: "check", 5: "estilo", 6: "strike", 7: "situacao",
+        8: "distancia_pct", 9: "ultimo", 10: "variacao_pct",
+        11: "data_ultimo_negocio", 12: "negocios", 13: "volume",
+        14: "volatilidade", 15: "delta", 16: "gamma", 17: "theta",
+        18: "theta_pct", 19: "vega", 20: "iq",
+    }
 
     for tabela in driver.find_elements(By.TAG_NAME, "table"):
 
@@ -225,10 +242,6 @@ def extrair_tabela_visivel(driver, ativo, tipo):
             for texto in cabecalhos_brutos
         ]
 
-        # A grade de opções é a única tabela que contém Ticker e Strike.
-        if "codigo" not in cabecalhos or "strike" not in cabecalhos:
-            continue
-
         for row in tabela.find_elements(By.TAG_NAME, "tr"):
             cols = row.find_elements(By.TAG_NAME, "td")
             dados = [c.text.strip() for c in cols]
@@ -241,7 +254,28 @@ def extrair_tabela_visivel(driver, ativo, tipo):
                     registro[cabecalhos[indice]] = valor
 
             codigo = normalizar_codigo(registro.get("codigo", ""))
-            if codigo and any(c.isdigit() for c in codigo):
+            strike_valido = moeda_para_float(registro.get("strike", "")) > 0
+
+            # Contingência para versões da grade que usam TD nos cabeçalhos
+            # ou inserem uma coluna técnica vazia.
+            if not codigo or not strike_valido:
+                if len(dados) == 18:
+                    mapa = mapa_18
+                elif len(dados) == 20:
+                    mapa = mapa_20
+                elif len(dados) >= 21:
+                    mapa = mapa_21
+                else:
+                    mapa = {}
+                registro = {
+                    nome: dados[indice]
+                    for indice, nome in mapa.items()
+                    if indice < len(dados)
+                }
+                codigo = normalizar_codigo(registro.get("codigo", ""))
+                strike_valido = moeda_para_float(registro.get("strike", "")) > 0
+
+            if codigo and any(c.isdigit() for c in codigo) and strike_valido:
                 registros.append(registro)
 
     colunas_finais = [
@@ -370,20 +404,47 @@ def selecionar_vencimento(driver, vencimento_texto):
     return False
 
 
+def texto_checkbox_vencimento(driver, checkbox):
+    """Obtém apenas o rótulo associado ao checkbox, mesmo com HTML variável."""
+    return driver.execute_script(
+        """
+        const el = arguments[0];
+        const textos = [];
+        const adicionar = (item) => {
+            if (!item) return;
+            const valor = (item.innerText || item.textContent || "").trim();
+            if (valor) textos.push(valor);
+        };
+
+        if (el.id) {
+            try {
+                adicionar(document.querySelector(`label[for="${CSS.escape(el.id)}"]`));
+            } catch (e) {}
+        }
+        adicionar(el.closest("label"));
+        adicionar(el.nextElementSibling);
+        if (el.nextSibling && el.nextSibling.textContent) {
+            textos.push(el.nextSibling.textContent.trim());
+        }
+        adicionar(el.parentElement);
+
+        // Prefere um fragmento que contenha uma única data.
+        for (const texto of textos) {
+            const datas = texto.match(/\\d{2}\\/\\d{2}(?:\\/\\d{4})?/g) || [];
+            if (datas.length === 1) return texto;
+        }
+        return "";
+        """,
+        checkbox,
+    )
+
+
 def listar_vencimentos_pagina(driver):
     """Lê os vencimentos realmente oferecidos para o ativo na página."""
     encontrados = []
     for checkbox in driver.find_elements(By.XPATH, "//input[@type='checkbox']"):
         try:
-            texto = driver.execute_script(
-                """
-                const el = arguments[0];
-                const pai = el.parentElement;
-                const avo = pai ? pai.parentElement : null;
-                return (pai && pai.innerText) || (avo && avo.innerText) || "";
-                """,
-                checkbox,
-            )
+            texto = texto_checkbox_vencimento(driver, checkbox)
             texto = re.sub(r"\s+", " ", str(texto)).strip()
             data_match = re.search(r"(\d{2})/(\d{2})(?:/(\d{4}))?", texto)
             if not data_match:
@@ -411,15 +472,7 @@ def ajustar_checkbox_vencimento(driver, referencia, selecionar):
     """Refaz a busca antes de cada clique para evitar elementos obsoletos."""
     for checkbox in driver.find_elements(By.XPATH, "//input[@type='checkbox']"):
         try:
-            texto = driver.execute_script(
-                """
-                const el = arguments[0];
-                const pai = el.parentElement;
-                const avo = pai ? pai.parentElement : null;
-                return (pai && pai.innerText) || (avo && avo.innerText) || "";
-                """,
-                checkbox,
-            )
+            texto = texto_checkbox_vencimento(driver, checkbox)
             texto_normalizado = re.sub(r"\s+", " ", str(texto)).strip()
             data_match = re.search(r"(\d{2})/(\d{2})", texto_normalizado)
             if not data_match:
@@ -561,7 +614,10 @@ def coletar_opcoes(
             data_exata=data_exata,
         )
         if not vencimentos_selecionados:
-            return pd.DataFrame()
+            raise ValueError(
+                f"Nenhum vencimento disponível foi reconhecido para {ativo} "
+                f"no mês {mes_num:02d}/{ano}."
+            )
 
         partes = []
         for tipo in ["CALL", "PUT"]:
@@ -578,7 +634,10 @@ def coletar_opcoes(
                     partes.append(parte)
 
         if not partes:
-            return pd.DataFrame()
+            raise ValueError(
+                f"Os vencimentos de {ativo} foram selecionados, mas a grade "
+                "de CALLs e PUTs não pôde ser lida."
+            )
 
         return pd.concat(partes, ignore_index=True).drop_duplicates(
             subset=["ativo", "codigo", "tipo"], keep="first"
