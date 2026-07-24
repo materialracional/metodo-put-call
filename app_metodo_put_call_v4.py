@@ -16,6 +16,8 @@ from selenium.webdriver.chrome.service import Service
 
 st.set_page_config(page_title="Método PUT + CALL", layout="wide")
 
+VERSAO_APP = "4.13.0 · 24/07/2026"
+
 ARQUIVO_OPERACOES = Path("operacoes_abertas.csv")
 
 COLUNAS = {
@@ -1157,6 +1159,27 @@ def enriquecer_operacoes(df):
 
 
 # ----------------------------- INTERFACE -----------------------------
+st.markdown(
+    f"""
+    <div style="
+        position:fixed;
+        top:3.4rem;
+        right:1.2rem;
+        z-index:999999;
+        padding:5px 11px;
+        border:1px solid #d0d5dd;
+        border-radius:999px;
+        background:rgba(255,255,255,0.96);
+        color:#475467;
+        font-size:12px;
+        font-weight:700;
+        box-shadow:0 2px 8px rgba(16,24,40,0.08);
+        white-space:nowrap;">
+        Versão {VERSAO_APP}
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 st.title("📈 MÉTODO PUT + CALL")
 st.caption("Oportunidades de mercado + acompanhamento das operações abertas")
 
