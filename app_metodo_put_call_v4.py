@@ -1,4 +1,6 @@
 import time
+import re
+import unicodedata
 from datetime import date, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -39,6 +41,11 @@ VENCIMENTOS_OPCOESNET = {
     "Out - 16/10": "16/10",
     "Nov - 19/11": "19/11",
     "Dez - 18/12": "18/12",
+}
+
+NOMES_MESES = {
+    1: "Jan", 2: "Fev", 3: "Mar", 4: "Abr", 5: "Mai", 6: "Jun",
+    7: "Jul", 8: "Ago", 9: "Set", 10: "Out", 11: "Nov", 12: "Dez",
 }
 
 COLUNAS_OPERACOES = [
@@ -96,6 +103,78 @@ def mes_opcao(codigo):
         return "Indef."
 
 
+def normalizar_texto(texto):
+    texto = unicodedata.normalize("NFKD", str(texto))
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", texto).strip().lower()
+
+
+def identificar_cabecalho(texto, ocorrencias):
+    """Converte os títulos visíveis do Opções.Net nos nomes usados pelo app."""
+    titulo = normalizar_texto(texto)
+    if not titulo:
+        return None
+    if "ticker" in titulo:
+        return "codigo"
+    if "vencimento" in titulo:
+        return "vencimento_opcao"
+    if "dias" in titulo and ("uteis" in titulo or "úteis" in str(texto).lower()):
+        return "dias_uteis"
+    if titulo in {"f.m.", "fm"}:
+        return "check"
+    if titulo.startswith("mod"):
+        return "estilo"
+    if "strike" == titulo:
+        return "strike"
+    if "ai/otm" in titulo or "a/i/otm" in titulo:
+        return "situacao"
+    if "dist" in titulo and "strike" in titulo:
+        return "distancia_pct"
+    if titulo.startswith("ultimo"):
+        return "ultimo"
+    if titulo.startswith("var"):
+        return "variacao_pct"
+    if "data/hora" in titulo or ("data" in titulo and "hora" in titulo):
+        return "data_ultimo_negocio"
+    if ("num" in titulo or "núm" in str(texto).lower()) and "neg" in titulo:
+        return "negocios"
+    if "vol" in titulo and "financeiro" in titulo:
+        return "volume"
+    if "vol" in titulo and "impl" in titulo:
+        return "volatilidade"
+    if titulo == "delta":
+        return "delta"
+    if titulo == "gamma":
+        return "gamma"
+    if titulo.startswith("theta"):
+        ocorrencias["theta"] = ocorrencias.get("theta", 0) + 1
+        if "%" in str(texto) or ocorrencias["theta"] > 1:
+            return "theta_pct"
+        return "theta"
+    if titulo == "vega":
+        return "vega"
+    if titulo == "iq":
+        return "iq"
+    if titulo.startswith("lambda"):
+        return "lambda"
+    return None
+
+
+def proximos_meses(quantidade=9):
+    """Gera os meses de busca sem manter datas fixas no código."""
+    hoje = date.today()
+    meses = []
+    ano, mes = hoje.year, hoje.month
+    for _ in range(quantidade):
+        rotulo = f"{NOMES_MESES[mes]}/{ano}"
+        meses.append((rotulo, mes, ano))
+        mes += 1
+        if mes == 13:
+            mes = 1
+            ano += 1
+    return meses
+
+
 def criar_driver():
     options = Options()
 
@@ -127,7 +206,7 @@ def extrair_tabela_visivel(driver, ativo, tipo):
     tipo é recebido como argumento e gravado em todas as linhas.
     """
 
-    linhas = []
+    registros = []
 
     for tabela in driver.find_elements(By.TAG_NAME, "table"):
 
@@ -137,23 +216,40 @@ def extrair_tabela_visivel(driver, ativo, tipo):
         except Exception:
             continue
 
-        for row in tabela.find_elements(By.TAG_NAME, "tr"):
+        cabecalhos_brutos = [
+            th.text.strip() for th in tabela.find_elements(By.TAG_NAME, "th")
+        ]
+        ocorrencias = {}
+        cabecalhos = [
+            identificar_cabecalho(texto, ocorrencias)
+            for texto in cabecalhos_brutos
+        ]
 
+        # A grade de opções é a única tabela que contém Ticker e Strike.
+        if "codigo" not in cabecalhos or "strike" not in cabecalhos:
+            continue
+
+        for row in tabela.find_elements(By.TAG_NAME, "tr"):
             cols = row.find_elements(By.TAG_NAME, "td")
             dados = [c.text.strip() for c in cols]
+            if not dados or len(dados) < 4:
+                continue
 
-            if dados:
-                print("=" * 80)
-                print(f"DEBUG {ativo}")
-                print(f"Quantidade de colunas: {len(dados)}")
-                print(dados)
+            registro = {}
+            for indice, valor in enumerate(dados):
+                if indice < len(cabecalhos) and cabecalhos[indice]:
+                    registro[cabecalhos[indice]] = valor
 
-                linhas.append(dados)
+            codigo = normalizar_codigo(registro.get("codigo", ""))
+            if codigo and any(c.isdigit() for c in codigo):
+                registros.append(registro)
 
     colunas_finais = [
         "ativo",
         "codigo",
         "tipo",
+        "vencimento_opcao",
+        "dias_uteis",
         "estilo",
         "strike",
         "situacao",
@@ -171,21 +267,10 @@ def extrair_tabela_visivel(driver, ativo, tipo):
         "lambda",
     ]
 
-    if not linhas:
+    if not registros:
         return pd.DataFrame(columns=colunas_finais)
 
-    # Descobre automaticamente a maior linha encontrada
-    largura = max(len(x) for x in linhas)
-
-    # Completa as menores
-    linhas = [x + [""] * (largura - len(x)) for x in linhas]
-
-    df = pd.DataFrame(linhas)
-
-    # Renomeia somente as colunas conhecidas
-    for i, nome in COLUNAS.items():
-        if i < len(df.columns):
-            df.rename(columns={i: nome}, inplace=True)
+    df = pd.DataFrame(registros)
 
     # Garante que existam todas as colunas
     for c in colunas_finais:
@@ -284,6 +369,130 @@ def selecionar_vencimento(driver, vencimento_texto):
 
     return False
 
+
+def listar_vencimentos_pagina(driver):
+    """Lê os vencimentos realmente oferecidos para o ativo na página."""
+    encontrados = []
+    for checkbox in driver.find_elements(By.XPATH, "//input[@type='checkbox']"):
+        try:
+            texto = driver.execute_script(
+                """
+                const el = arguments[0];
+                const pai = el.parentElement;
+                const avo = pai ? pai.parentElement : null;
+                return (pai && pai.innerText) || (avo && avo.innerText) || "";
+                """,
+                checkbox,
+            )
+            texto = re.sub(r"\s+", " ", str(texto)).strip()
+            data_match = re.search(r"(\d{2})/(\d{2})(?:/(\d{4}))?", texto)
+            if not data_match:
+                continue
+            semana_match = re.search(r"\bW([1-5])\b", texto, flags=re.IGNORECASE)
+            dias_match = re.search(r"(\d+)\s*d\.?\s*u\.?", texto, flags=re.IGNORECASE)
+            encontrados.append(
+                {
+                    "dia": int(data_match.group(1)),
+                    "mes": int(data_match.group(2)),
+                    "ano_texto": int(data_match.group(3)) if data_match.group(3) else None,
+                    "semanal": bool(semana_match),
+                    "semana": int(semana_match.group(1)) if semana_match else None,
+                    "dias_uteis": int(dias_match.group(1)) if dias_match else None,
+                    "texto": texto,
+                    "selecionado": checkbox.is_selected(),
+                }
+            )
+        except Exception:
+            continue
+    return encontrados
+
+
+def ajustar_checkbox_vencimento(driver, referencia, selecionar):
+    """Refaz a busca antes de cada clique para evitar elementos obsoletos."""
+    for checkbox in driver.find_elements(By.XPATH, "//input[@type='checkbox']"):
+        try:
+            texto = driver.execute_script(
+                """
+                const el = arguments[0];
+                const pai = el.parentElement;
+                const avo = pai ? pai.parentElement : null;
+                return (pai && pai.innerText) || (avo && avo.innerText) || "";
+                """,
+                checkbox,
+            )
+            texto_normalizado = re.sub(r"\s+", " ", str(texto)).strip()
+            data_match = re.search(r"(\d{2})/(\d{2})", texto_normalizado)
+            if not data_match:
+                continue
+            semanal = bool(re.search(r"\bW[1-5]\b", texto_normalizado, flags=re.IGNORECASE))
+            mesma_data = (
+                int(data_match.group(1)) == referencia["dia"]
+                and int(data_match.group(2)) == referencia["mes"]
+            )
+            if mesma_data and semanal == referencia["semanal"]:
+                if checkbox.is_selected() != selecionar:
+                    driver.execute_script("arguments[0].click();", checkbox)
+                    time.sleep(1)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def configurar_vencimentos(
+    driver, mes_num, ano, incluir_semanais=False, data_exata=None
+):
+    """Seleciona o mensal e, opcionalmente, as semanais existentes no mês."""
+    time.sleep(2)
+    disponiveis = listar_vencimentos_pagina(driver)
+    if not disponiveis:
+        return []
+
+    if data_exata:
+        try:
+            dia_alvo, mes_alvo = [int(x) for x in data_exata[:5].split("/")]
+        except (TypeError, ValueError):
+            return []
+        desejados = [
+            item for item in disponiveis
+            if item["dia"] == dia_alvo and item["mes"] == mes_alvo
+        ]
+    else:
+        desejados = [
+            item for item in disponiveis
+            if item["mes"] == mes_num
+            and (incluir_semanais or not item["semanal"])
+        ]
+
+    # Limpa somente os checkboxes reconhecidos como vencimentos.
+    for item in disponiveis:
+        if item["selecionado"]:
+            ajustar_checkbox_vencimento(driver, item, False)
+
+    selecionados = []
+    hoje = date.today()
+    for item in desejados:
+        ano_item = item["ano_texto"] or ano
+        try:
+            data_item = date(ano_item, item["mes"], item["dia"])
+        except ValueError:
+            continue
+        if not data_exata and data_item < hoje:
+            continue
+        if ajustar_checkbox_vencimento(driver, item, True):
+            selecionados.append(
+                {
+                    **item,
+                    "ano": ano_item,
+                    "data": data_item.strftime("%d/%m/%Y"),
+                    "tipo_vencimento": "Semanal" if item["semanal"] else "Mensal",
+                }
+            )
+
+    if selecionados:
+        time.sleep(4)
+    return selecionados
+
 def aceitar_dados_fechamento(driver):
     textos = [
         "Continuar com dados de fechamento",
@@ -317,7 +526,14 @@ def aceitar_dados_fechamento(driver):
     return False
 
 
-def coletar_opcoes(ativo, vencimento_escolhido):
+def coletar_opcoes(
+    ativo,
+    vencimento_escolhido=None,
+    mes_num=None,
+    ano=None,
+    incluir_semanais=False,
+    data_exata=None,
+):
     url = f"https://opcoes.net.br/opcoes/bovespa/{ativo}"
     driver = None
     try:
@@ -326,8 +542,25 @@ def coletar_opcoes(ativo, vencimento_escolhido):
         time.sleep(7)
         aceitar_dados_fechamento(driver)
 
-        vencimento_texto = VENCIMENTOS_OPCOESNET.get(vencimento_escolhido)
-        if vencimento_texto and not selecionar_vencimento(driver, vencimento_texto):
+        if data_exata is None and vencimento_escolhido:
+            data_exata = VENCIMENTOS_OPCOESNET.get(vencimento_escolhido)
+
+        if data_exata and mes_num is None:
+            try:
+                mes_num = int(data_exata.split("/")[1])
+            except (IndexError, ValueError):
+                mes_num = date.today().month
+        mes_num = mes_num or date.today().month
+        ano = ano or date.today().year
+
+        vencimentos_selecionados = configurar_vencimentos(
+            driver,
+            mes_num=mes_num,
+            ano=ano,
+            incluir_semanais=incluir_semanais,
+            data_exata=data_exata,
+        )
+        if not vencimentos_selecionados:
             return pd.DataFrame()
 
         partes = []
@@ -335,6 +568,13 @@ def coletar_opcoes(ativo, vencimento_escolhido):
             if selecionar_tipo(driver, tipo):
                 parte = extrair_tabela_visivel(driver, ativo, tipo)
                 if not parte.empty:
+                    if (
+                        len(vencimentos_selecionados) == 1
+                        and parte["vencimento_opcao"].astype(str).str.strip().eq("").all()
+                    ):
+                        unico = vencimentos_selecionados[0]
+                        parte["vencimento_opcao"] = unico["data"]
+                        parte["dias_uteis"] = unico["dias_uteis"] or ""
                     partes.append(parte)
 
         if not partes:
@@ -350,6 +590,9 @@ def coletar_opcoes(ativo, vencimento_escolhido):
 
 def preparar(df):
     df = df.copy()
+    for coluna in ["vencimento_opcao", "dias_uteis"]:
+        if coluna not in df.columns:
+            df[coluna] = ""
     for col in [
         "strike", "distancia_pct", "ultimo", "variacao_pct", "negocios", "volume",
         "volatilidade", "delta", "gamma", "theta", "vega", "lambda"
@@ -358,6 +601,12 @@ def preparar(df):
 
     df["codigo"] = df["codigo"].apply(normalizar_codigo)
     df["tipo"] = df["tipo"].astype(str).str.upper().str.strip()
+    df["dias_uteis"] = df["dias_uteis"].apply(moeda_para_float).astype(int)
+    df["tipo_vencimento"] = df["codigo"].apply(
+        lambda codigo: "Semanal"
+        if re.search(r"W[1-5]$", normalizar_codigo(codigo))
+        else "Mensal"
+    )
     df["mes"] = df["codigo"].apply(mes_opcao)
     df["premio_total"] = df["ultimo"] * 100
     df["preco_efetivo_put"] = df["strike"] - df["ultimo"]
@@ -386,6 +635,11 @@ def preparar(df):
     df["retorno_pct"] = df.apply(
         lambda r: (r["ultimo"] / r["cotacao_atual"] * 100)
         if r["cotacao_atual"] > 0 else 0,
+        axis=1,
+    )
+    df["retorno_equiv_mensal_pct"] = df.apply(
+        lambda r: (r["retorno_pct"] * 21 / r["dias_uteis"])
+        if r["dias_uteis"] > 0 else r["retorno_pct"],
         axis=1,
     )
     df["venda_efetiva_pct"] = df.apply(
@@ -446,12 +700,16 @@ def card_diagnostico(op, tipo, objetivo_put="Gerar renda"):
     retorno_pct = float(op.get("retorno_pct", 0) or 0)
     chance_implicita, chance_texto, chance_icone = classificar_chance_exercicio(delta)
 
-    vencimento_carregado = str(st.session_state.get("vencimento_carregado", ""))
-    data_vencimento = (
-        vencimento_carregado.split(" - ", 1)[1]
-        if " - " in vencimento_carregado
-        else vencimento_carregado or "o vencimento"
-    )
+    data_vencimento = str(op.get("vencimento_opcao", "") or "").strip()
+    if not data_vencimento:
+        vencimento_carregado = str(st.session_state.get("vencimento_carregado", ""))
+        data_vencimento = (
+            vencimento_carregado.split(" - ", 1)[1]
+            if " - " in vencimento_carregado
+            else vencimento_carregado or "o vencimento"
+        )
+    tipo_vencimento = str(op.get("tipo_vencimento", "Mensal") or "Mensal")
+    dias_uteis = int(float(op.get("dias_uteis", 0) or 0))
 
     if negocios >= 10:
         liquidez_texto, liquidez_icone = "Boa", "🟢"
@@ -471,7 +729,9 @@ def card_diagnostico(op, tipo, objetivo_put="Gerar renda"):
             <div style="margin-top:10px;font-size:16px;color:#667085;">Opção selecionada</div>
             <div style="font-size:30px;line-height:1.10;font-weight:800;color:#101828;">{codigo}</div>
             <div style="margin-top:10px;font-size:15px;color:#475467;">
-                {tipo} &nbsp;•&nbsp; Strike {fmt_rs(strike)} &nbsp;•&nbsp; Vencimento {data_vencimento}
+                {tipo} &nbsp;•&nbsp; Strike {fmt_rs(strike)} &nbsp;•&nbsp;
+                {tipo_vencimento} &nbsp;•&nbsp; Vencimento {data_vencimento}
+                {f"&nbsp;•&nbsp; {dias_uteis} dias úteis" if dias_uteis else ""}
             </div>
         </div>
         """,
@@ -880,11 +1140,27 @@ with aba_oportunidades:
 
     st.divider()
     st.subheader("Vencimento para buscar")
-    vencimento_busca = st.radio(
-        "Escolha o vencimento antes de atualizar o mercado:",
-        list(VENCIMENTOS_OPCOESNET.keys()), horizontal=True
+    meses_busca = proximos_meses()
+    rotulos_meses = [item[0] for item in meses_busca]
+    mes_busca_rotulo = st.selectbox(
+        "Mês do vencimento:",
+        rotulos_meses,
+        key="mes_vencimento_busca",
     )
-    st.caption("O app busca apenas o vencimento escolhido para reduzir o tempo e os travamentos.")
+    mes_busca_item = next(item for item in meses_busca if item[0] == mes_busca_rotulo)
+    mes_busca_num, ano_busca = mes_busca_item[1], mes_busca_item[2]
+    incluir_semanais = st.checkbox(
+        "Incluir vencimentos semanais deste mês",
+        value=False,
+        help=(
+            "O app verifica no Opções.Net quais vencimentos semanais realmente "
+            "existem para cada ativo. Se não houver, mantém apenas o mensal."
+        ),
+    )
+    st.caption(
+        "Com o checkbox desmarcado, o app busca somente o vencimento mensal. "
+        "Marcado, reúne o mensal e as semanais ainda disponíveis no mês."
+    )
 
     if st.button("🔄 Atualizar mercado", type="primary"):
         dfs = []
@@ -892,13 +1168,21 @@ with aba_oportunidades:
         status = st.empty()
 
         for i, emp in enumerate(st.session_state.empresas):
-            status.write(f"Coletando {emp} — vencimento: {vencimento_busca}...")
+            modo_busca = "mensal + semanais" if incluir_semanais else "mensal"
+            status.write(f"Coletando {emp} — {mes_busca_rotulo} ({modo_busca})...")
             try:
-                df_emp = coletar_opcoes(emp, vencimento_busca)
+                df_emp = coletar_opcoes(
+                    emp,
+                    mes_num=mes_busca_num,
+                    ano=ano_busca,
+                    incluir_semanais=incluir_semanais,
+                )
                 if not df_emp.empty:
                     dfs.append(df_emp)
                 else:
-                    st.warning(f"Nenhuma opção encontrada para {emp}.")
+                    st.warning(
+                        f"Nenhuma opção encontrada para {emp} em {mes_busca_rotulo}."
+                    )
             except Exception as e:
                 st.warning(f"Erro em {emp}: {e}")
             progress.progress((i + 1) / max(len(st.session_state.empresas), 1))
@@ -907,19 +1191,27 @@ with aba_oportunidades:
         if dfs:
             dados = preparar(pd.concat(dfs, ignore_index=True))
             meses_coletados = sorted(dados["mes"].dropna().unique().tolist())
-
-            if vencimento_busca != "Vencimento atual":
-                mes_nome = vencimento_busca.split(" - ")[0]
-                if mes_nome not in meses_coletados:
-                    st.error(
-                        f"Não consegui acessar o vencimento '{vencimento_busca}'. "
-                        f"A coleta retornou: {', '.join(meses_coletados) or 'nenhum mês'}"
-                    )
-                dados = dados[dados["mes"] == mes_nome]
+            mes_nome = NOMES_MESES[mes_busca_num]
+            if mes_nome not in meses_coletados:
+                st.error(
+                    f"Não consegui acessar {mes_busca_rotulo}. "
+                    f"A coleta retornou: {', '.join(meses_coletados) or 'nenhum mês'}"
+                )
+            dados = dados[dados["mes"] == mes_nome]
 
             st.session_state.dados = dados
-            st.session_state.vencimento_carregado = vencimento_busca
-            st.success(f"Mercado atualizado para: {vencimento_busca}")
+            st.session_state.vencimento_carregado = mes_busca_rotulo
+            st.session_state.incluiu_semanais = incluir_semanais
+            semanais_encontradas = dados[
+                dados["tipo_vencimento"] == "Semanal"
+            ]["vencimento_opcao"].nunique()
+            if incluir_semanais:
+                st.success(
+                    f"Mercado atualizado para {mes_busca_rotulo}. "
+                    f"Vencimentos semanais encontrados: {semanais_encontradas}."
+                )
+            else:
+                st.success(f"Mercado mensal atualizado para {mes_busca_rotulo}.")
         else:
             st.error("Nenhuma opção foi coletada.")
 
@@ -928,7 +1220,7 @@ with aba_oportunidades:
     else:
         df = st.session_state.dados
         st.divider()
-        st.write(f"Vencimento carregado: **{st.session_state.get('vencimento_carregado', 'Indefinido')}**")
+        st.write(f"Mês carregado: **{st.session_state.get('vencimento_carregado', 'Indefinido')}**")
         st.write(f"Opções analisadas: **{len(df)}**")
 
         if df.empty:
@@ -958,15 +1250,24 @@ with aba_oportunidades:
                 )
 
             st.markdown("### Comparar oportunidades")
+            if st.session_state.get("incluiu_semanais", False):
+                st.caption(
+                    "O equivalente mensal normaliza o retorno para 21 dias úteis "
+                    "apenas para comparação; não é promessa de retorno nem pressupõe "
+                    "que a operação poderá ser repetida."
+                )
+            criterios_ordenacao = [
+                "Maior retorno",
+                "Maior retorno equivalente mensal",
+                "Menor chance implícita de exercício",
+                "Maior venda efetiva / menor custo efetivo",
+                "Maior distância até o strike",
+                "Maior liquidez",
+            ]
             criterio_ordem = st.selectbox(
                 "Ordenar opções por:",
-                [
-                    "Maior retorno",
-                    "Menor chance implícita de exercício",
-                    "Maior venda efetiva / menor custo efetivo",
-                    "Maior distância até o strike",
-                    "Maior liquidez",
-                ],
+                criterios_ordenacao,
+                index=1 if st.session_state.get("incluiu_semanais", False) else 0,
                 key="criterio_ordenacao_oportunidades",
             )
 
@@ -976,6 +1277,13 @@ with aba_oportunidades:
             if criterio_ordem == "Maior retorno":
                 calls_todas = calls_todas.sort_values("retorno_pct", ascending=False)
                 puts_todas = puts_todas.sort_values("retorno_pct", ascending=False)
+            elif criterio_ordem == "Maior retorno equivalente mensal":
+                calls_todas = calls_todas.sort_values(
+                    "retorno_equiv_mensal_pct", ascending=False
+                )
+                puts_todas = puts_todas.sort_values(
+                    "retorno_equiv_mensal_pct", ascending=False
+                )
             elif criterio_ordem == "Menor chance implícita de exercício":
                 calls_todas = calls_todas.sort_values("chance_exercicio_pct", ascending=True)
                 puts_todas = puts_todas.sort_values("chance_exercicio_pct", ascending=True)
@@ -996,6 +1304,14 @@ with aba_oportunidades:
 
             for tabela_op in (calls, puts):
                 tabela_op["Retorno"] = tabela_op["retorno_pct"].map(lambda x: f"{x:.2f}%".replace(".", ","))
+                tabela_op["Equiv. mensal"] = tabela_op["retorno_equiv_mensal_pct"].map(
+                    lambda x: f"{x:.2f}%".replace(".", ",")
+                )
+                tabela_op["Vencimento"] = tabela_op["vencimento_opcao"].astype(str)
+                tabela_op["Prazo"] = tabela_op["dias_uteis"].map(
+                    lambda x: f"{int(x)} d.u." if x else "—"
+                )
+                tabela_op["Série"] = tabela_op["tipo_vencimento"]
                 tabela_op["Chance implícita"] = tabela_op["chance_exercicio_pct"].map(
                     lambda x: f"{x:.0f}% · {classificar_chance_exercicio(x / 100)[1]}"
                 )
@@ -1016,7 +1332,11 @@ with aba_oportunidades:
                     cod_call = None
                 else:
                     st.dataframe(
-                        calls[["ativo", "codigo", "Retorno", "Venda efetiva", "Precisa subir", "Chance implícita"]],
+                        calls[[
+                            "ativo", "codigo", "Série", "Vencimento", "Prazo",
+                            "Retorno", "Equiv. mensal", "Venda efetiva",
+                            "Precisa subir", "Chance implícita"
+                        ]],
                         use_container_width=True,
                         hide_index=True,
                     )
@@ -1053,7 +1373,11 @@ with aba_oportunidades:
                     )
 
                     st.dataframe(
-                        puts[["ativo", "codigo", "Retorno", "Custo efetivo", "Distância do strike", "Chance implícita"]],
+                        puts[[
+                            "ativo", "codigo", "Série", "Vencimento", "Prazo",
+                            "Retorno", "Equiv. mensal", "Custo efetivo",
+                            "Distância do strike", "Chance implícita"
+                        ]],
                         use_container_width=True,
                         hide_index=True,
                     )
@@ -1145,20 +1469,31 @@ with aba_operacoes:
 
             for indice, grupo in enumerate(grupos):
                 ativo_grupo = normalizar_codigo(grupo["ativo_base"])
-                rotulo_vencimento = vencimento_opcoesnet(grupo["vencimento"])
                 status_ops.write(f"Buscando {ativo_grupo} — {grupo['vencimento']}...")
 
-                if rotulo_vencimento is None:
+                try:
+                    data_operacao = datetime.strptime(
+                        str(grupo["vencimento"])[:10], "%Y-%m-%d"
+                    ).date()
+                    data_exata = data_operacao.strftime("%d/%m")
+                except ValueError:
+                    data_operacao = None
+
+                if data_operacao is None:
                     st.warning(
-                        f"O vencimento {grupo['vencimento']} de {ativo_grupo} ainda não está "
-                        "configurado na lista de vencimentos do app."
+                        f"O vencimento {grupo['vencimento']} de {ativo_grupo} é inválido."
                     )
                 else:
                     try:
-                        parte = coletar_opcoes(ativo_grupo, rotulo_vencimento)
+                        parte = coletar_opcoes(
+                            ativo_grupo,
+                            mes_num=data_operacao.month,
+                            ano=data_operacao.year,
+                            data_exata=data_exata,
+                        )
                         if not parte.empty:
                             parte = preparar(parte)
-                            mes_nome = rotulo_vencimento.split(" - ")[0]
+                            mes_nome = NOMES_MESES[data_operacao.month]
                             parte = parte[parte["mes"] == mes_nome]
                             partes_operacoes.append(parte)
                         else:
