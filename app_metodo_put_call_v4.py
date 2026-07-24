@@ -16,7 +16,7 @@ from selenium.webdriver.chrome.service import Service
 
 st.set_page_config(page_title="Método PUT + CALL", layout="wide")
 
-VERSAO_APP = "4.13.0 · 24/07/2026"
+VERSAO_APP = "4.14.0 · 24/07/2026"
 
 ARQUIVO_OPERACOES = Path("operacoes_abertas.csv")
 
@@ -497,7 +497,7 @@ def ajustar_checkbox_vencimento(driver, referencia, selecionar):
 def configurar_vencimentos(
     driver, mes_num, ano, incluir_semanais=False, data_exata=None
 ):
-    """Seleciona o mensal e, opcionalmente, as semanais existentes no mês."""
+    """Identifica o mensal e, opcionalmente, as semanais existentes no mês."""
     time.sleep(2)
     disponiveis = listar_vencimentos_pagina(driver)
     if not disponiveis:
@@ -524,7 +524,7 @@ def configurar_vencimentos(
         if item["selecionado"]:
             ajustar_checkbox_vencimento(driver, item, False)
 
-    selecionados = []
+    vencimentos_alvo = []
     hoje = date.today()
     for item in desejados:
         ano_item = item["ano_texto"] or ano
@@ -534,19 +534,38 @@ def configurar_vencimentos(
             continue
         if not data_exata and data_item < hoje:
             continue
-        if ajustar_checkbox_vencimento(driver, item, True):
-            selecionados.append(
-                {
-                    **item,
-                    "ano": ano_item,
-                    "data": data_item.strftime("%d/%m/%Y"),
-                    "tipo_vencimento": "Semanal" if item["semanal"] else "Mensal",
-                }
-            )
+        vencimentos_alvo.append(
+            {
+                **item,
+                "ano": ano_item,
+                "data": data_item.strftime("%d/%m/%Y"),
+                "tipo_vencimento": "Semanal" if item["semanal"] else "Mensal",
+            }
+        )
 
-    if selecionados:
+    return sorted(
+        vencimentos_alvo,
+        key=lambda item: (item["ano"], item["mes"], item["dia"]),
+    )
+
+
+def selecionar_apenas_um_vencimento(driver, vencimento):
+    """
+    Mantém somente um vencimento marcado.
+
+    A grade do Opções.Net muda de estrutura quando vários vencimentos são
+    exibidos ao mesmo tempo. A coleta individual preserva o formato estável
+    da tabela e os resultados são reunidos depois pelo app.
+    """
+    disponiveis = listar_vencimentos_pagina(driver)
+    for item in disponiveis:
+        if item["selecionado"]:
+            ajustar_checkbox_vencimento(driver, item, False)
+
+    selecionado = ajustar_checkbox_vencimento(driver, vencimento, True)
+    if selecionado:
         time.sleep(4)
-    return selecionados
+    return selecionado
 
 def aceitar_dados_fechamento(driver):
     textos = [
@@ -622,27 +641,36 @@ def coletar_opcoes(
             )
 
         partes = []
-        for tipo in ["CALL", "PUT"]:
-            if selecionar_tipo(driver, tipo):
-                parte = extrair_tabela_visivel(driver, ativo, tipo)
-                if not parte.empty:
-                    if (
-                        len(vencimentos_selecionados) == 1
-                        and parte["vencimento_opcao"].astype(str).str.strip().eq("").all()
-                    ):
-                        unico = vencimentos_selecionados[0]
-                        parte["vencimento_opcao"] = unico["data"]
-                        parte["dias_uteis"] = unico["dias_uteis"] or ""
-                    partes.append(parte)
+        vencimentos_lidos = 0
+        for vencimento in vencimentos_selecionados:
+            if not selecionar_apenas_um_vencimento(driver, vencimento):
+                continue
+
+            houve_leitura = False
+            for tipo in ["CALL", "PUT"]:
+                if selecionar_tipo(driver, tipo):
+                    parte = extrair_tabela_visivel(driver, ativo, tipo)
+                    if not parte.empty:
+                        # Como a coleta é feita com apenas um vencimento
+                        # selecionado, estes dados são inequívocos mesmo que
+                        # a grade omita as colunas de data e prazo.
+                        parte["vencimento_opcao"] = vencimento["data"]
+                        parte["dias_uteis"] = vencimento["dias_uteis"] or ""
+                        partes.append(parte)
+                        houve_leitura = True
+
+            if houve_leitura:
+                vencimentos_lidos += 1
 
         if not partes:
             raise ValueError(
-                f"Os vencimentos de {ativo} foram selecionados, mas a grade "
-                "de CALLs e PUTs não pôde ser lida."
+                f"Foram encontrados {len(vencimentos_selecionados)} vencimento(s) "
+                f"para {ativo}, mas a grade individual de CALLs e PUTs não pôde "
+                "ser lida."
             )
 
         return pd.concat(partes, ignore_index=True).drop_duplicates(
-            subset=["ativo", "codigo", "tipo"], keep="first"
+            subset=["ativo", "codigo", "tipo", "vencimento_opcao"], keep="first"
         )
     finally:
         if driver is not None:
@@ -1159,28 +1187,28 @@ def enriquecer_operacoes(df):
 
 
 # ----------------------------- INTERFACE -----------------------------
-st.markdown(
-    f"""
-    <div style="
-        position:fixed;
-        top:3.4rem;
-        right:1.2rem;
-        z-index:999999;
-        padding:5px 11px;
-        border:1px solid #d0d5dd;
-        border-radius:999px;
-        background:rgba(255,255,255,0.96);
-        color:#475467;
-        font-size:12px;
-        font-weight:700;
-        box-shadow:0 2px 8px rgba(16,24,40,0.08);
-        white-space:nowrap;">
-        Versão {VERSAO_APP}
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-st.title("📈 MÉTODO PUT + CALL")
+cabecalho_titulo, cabecalho_versao = st.columns([5, 1])
+with cabecalho_titulo:
+    st.title("📈 MÉTODO PUT + CALL")
+with cabecalho_versao:
+    st.markdown(
+        f"""
+        <div style="
+            margin-top:1.15rem;
+            padding:6px 10px;
+            border:1px solid #d0d5dd;
+            border-radius:999px;
+            background:#f8fafc;
+            color:#475467;
+            font-size:12px;
+            font-weight:700;
+            text-align:center;
+            white-space:nowrap;">
+            Versão {VERSAO_APP}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 st.caption("Oportunidades de mercado + acompanhamento das operações abertas")
 
 if "empresas" not in st.session_state:
