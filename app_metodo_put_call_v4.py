@@ -16,7 +16,7 @@ from selenium.webdriver.chrome.service import Service
 
 st.set_page_config(page_title="Método PUT + CALL", layout="wide")
 
-VERSAO_APP = "4.14.0 · 24/07/2026"
+VERSAO_APP = "4.15.0 · 25/07/2026"
 
 ARQUIVO_OPERACOES = Path("operacoes_abertas.csv")
 
@@ -199,6 +199,78 @@ def criar_driver():
         options=options
     )
 
+
+def mapear_linha_opcoes(dados):
+    """
+    Mapeia uma linha pela sequência estrutural da grade.
+
+    O Opções.Net pode exibir ou ocultar Vencimento e Dias úteis e também
+    inserir uma coluna técnica vazia depois do ticker. Por isso, o ponto de
+    referência mais confiável é a sequência:
+    Mod. (A/E) -> Strike -> AI/OTM (ITM/ATM/OTM).
+    """
+    if not dados:
+        return {}
+
+    indice_situacao = None
+    for indice, valor in enumerate(dados[:12]):
+        if normalizar_texto(valor).upper() in {"ITM", "ATM", "OTM"}:
+            indice_situacao = indice
+            break
+
+    if indice_situacao is None or indice_situacao < 2:
+        return {}
+
+    indice_strike = indice_situacao - 1
+    indice_estilo = indice_situacao - 2
+    strike = moeda_para_float(dados[indice_strike])
+    estilo = normalizar_texto(dados[indice_estilo]).upper()
+    if strike <= 0 or estilo not in {"A", "E"}:
+        return {}
+
+    registro = {
+        "codigo": dados[0],
+        "estilo": dados[indice_estilo],
+        "strike": dados[indice_strike],
+        "situacao": dados[indice_situacao],
+    }
+
+    # O campo imediatamente anterior ao estilo corresponde ao F.M.
+    if indice_estilo > 0:
+        registro["check"] = dados[indice_estilo - 1]
+
+    # Se a data e o prazo estiverem presentes, identifica-os pelo conteúdo,
+    # sem depender da existência da coluna técnica vazia.
+    for indice in range(1, indice_estilo):
+        if re.fullmatch(r"\d{2}/\d{2}/\d{4}", str(dados[indice]).strip()):
+            registro["vencimento_opcao"] = dados[indice]
+            if indice + 1 < indice_estilo:
+                registro["dias_uteis"] = dados[indice + 1]
+            break
+
+    campos_apos_situacao = [
+        "distancia_pct",
+        "ultimo",
+        "variacao_pct",
+        "data_ultimo_negocio",
+        "negocios",
+        "volume",
+        "volatilidade",
+        "delta",
+        "gamma",
+        "theta",
+        "theta_pct",
+        "vega",
+        "iq",
+    ]
+    for deslocamento, nome in enumerate(campos_apos_situacao, start=1):
+        indice = indice_situacao + deslocamento
+        if indice < len(dados):
+            registro[nome] = dados[indice]
+
+    return registro
+
+
 def extrair_tabela_visivel(driver, ativo, tipo):
     """
     Extrai a grade atual do Opções.Net.Br.
@@ -250,16 +322,23 @@ def extrair_tabela_visivel(driver, ativo, tipo):
             if not dados or len(dados) < 4:
                 continue
 
-            registro = {}
-            for indice, valor in enumerate(dados):
-                if indice < len(cabecalhos) and cabecalhos[indice]:
-                    registro[cabecalhos[indice]] = valor
+            # A sequência estrutural é usada primeiro porque a página pode
+            # ter cabeçalhos sem a coluna técnica existente no corpo.
+            registro = mapear_linha_opcoes(dados)
 
             codigo = normalizar_codigo(registro.get("codigo", ""))
             strike_valido = moeda_para_float(registro.get("strike", "")) > 0
 
-            # Contingência para versões da grade que usam TD nos cabeçalhos
-            # ou inserem uma coluna técnica vazia.
+            # Contingência para uma eventual versão sem a sequência
+            # Mod. -> Strike -> AI/OTM.
+            if not codigo or not strike_valido:
+                registro = {}
+                for indice, valor in enumerate(dados):
+                    if indice < len(cabecalhos) and cabecalhos[indice]:
+                        registro[cabecalhos[indice]] = valor
+                codigo = normalizar_codigo(registro.get("codigo", ""))
+                strike_valido = moeda_para_float(registro.get("strike", "")) > 0
+
             if not codigo or not strike_valido:
                 if len(dados) == 18:
                     mapa = mapa_18
@@ -277,7 +356,18 @@ def extrair_tabela_visivel(driver, ativo, tipo):
                 codigo = normalizar_codigo(registro.get("codigo", ""))
                 strike_valido = moeda_para_float(registro.get("strike", "")) > 0
 
-            if codigo and any(c.isdigit() for c in codigo) and strike_valido:
+            ultimo = moeda_para_float(registro.get("ultimo", ""))
+            distancia = moeda_para_float(registro.get("distancia_pct", ""))
+            codigo_do_ativo = codigo.startswith(normalizar_codigo(ativo)[:4])
+            valores_coerentes = ultimo >= 0 and -100 < distancia < 100
+
+            if (
+                codigo
+                and any(c.isdigit() for c in codigo)
+                and codigo_do_ativo
+                and strike_valido
+                and valores_coerentes
+            ):
                 registros.append(registro)
 
     colunas_finais = [
@@ -641,7 +731,6 @@ def coletar_opcoes(
             )
 
         partes = []
-        vencimentos_lidos = 0
         for vencimento in vencimentos_selecionados:
             if not selecionar_apenas_um_vencimento(driver, vencimento):
                 continue
@@ -658,9 +747,6 @@ def coletar_opcoes(
                         parte["dias_uteis"] = vencimento["dias_uteis"] or ""
                         partes.append(parte)
                         houve_leitura = True
-
-            if houve_leitura:
-                vencimentos_lidos += 1
 
         if not partes:
             raise ValueError(
@@ -691,6 +777,16 @@ def preparar(df):
     df["codigo"] = df["codigo"].apply(normalizar_codigo)
     df["tipo"] = df["tipo"].astype(str).str.upper().str.strip()
     df["dias_uteis"] = df["dias_uteis"].apply(moeda_para_float).astype(int)
+
+    # Linhas sem prêmio negociado não representam uma oportunidade executável.
+    # As demais barreiras impedem que um eventual desalinhamento da página
+    # produza percentuais absurdos no parecer.
+    df = df[
+        (df["strike"] > 0)
+        & (df["ultimo"] > 0)
+        & (df["distancia_pct"] > -100)
+        & (df["distancia_pct"] < 100)
+    ].copy()
     df["tipo_vencimento"] = df["codigo"].apply(
         lambda codigo: "Semanal"
         if re.search(r"W[1-5]$", normalizar_codigo(codigo))
