@@ -16,7 +16,7 @@ from selenium.webdriver.chrome.service import Service
 
 st.set_page_config(page_title="Método PUT + CALL", layout="wide")
 
-VERSAO_APP = "4.15.0 · 25/07/2026"
+VERSAO_APP = "4.16.0 · 29/07/2026"
 
 ARQUIVO_OPERACOES = Path("operacoes_abertas.csv")
 
@@ -838,7 +838,88 @@ def preparar(df):
         if r["cotacao_atual"] > 0 else 0,
         axis=1,
     )
+    df["cotacao_site"] = df["cotacao_atual"]
+    df["distancia_pct_site"] = df["distancia_pct"]
+    df["cotacao_manual"] = False
     return df
+
+
+def aplicar_cotacoes_manuais(df, cotacoes_manuais=None):
+    """Recalcula indicadores da ação sem alterar prêmio e Delta coletados."""
+    resultado = df.copy()
+    cotacoes_manuais = cotacoes_manuais or {}
+    if "cotacao_site" not in resultado.columns:
+        resultado["cotacao_site"] = resultado["cotacao_atual"]
+    resultado["cotacao_atual"] = resultado["cotacao_site"]
+    resultado["cotacao_manual"] = False
+
+    for ativo, cotacao in cotacoes_manuais.items():
+        try:
+            valor = float(cotacao)
+        except (TypeError, ValueError):
+            continue
+        if valor > 0:
+            mascara = (
+                resultado["ativo"].astype(str).str.upper().str.strip()
+                == str(ativo).upper().strip()
+            )
+            resultado.loc[mascara, "cotacao_atual"] = valor
+            resultado.loc[mascara, "cotacao_manual"] = True
+
+    resultado["distancia_pct"] = resultado.apply(
+        lambda r: ((r["strike"] / r["cotacao_atual"]) - 1) * 100
+        if r["cotacao_atual"] > 0 else 0,
+        axis=1,
+    )
+    resultado["situacao"] = resultado.apply(
+        lambda r: (
+            "ATM"
+            if abs(r["distancia_pct"]) <= 0.5
+            else (
+                "OTM"
+                if (
+                    (r["tipo"] == "CALL" and r["distancia_pct"] > 0)
+                    or (r["tipo"] == "PUT" and r["distancia_pct"] < 0)
+                )
+                else "ITM"
+            )
+        ),
+        axis=1,
+    )
+    resultado["score_distancia"] = abs(resultado["distancia_pct"]).apply(
+        lambda x: 4 if x >= 3 else 3 if x >= 1.5 else 2 if x >= 0.5 else 1
+    )
+    resultado["score_total"] = (
+        resultado["score_premio"]
+        + resultado["score_liquidez"]
+        + resultado["score_distancia"]
+    )
+    resultado["diagnostico"] = resultado["score_total"].apply(
+        lambda x: "Muito boa"
+        if x >= 10 else "Boa" if x >= 8 else "Regular" if x >= 6 else "Fraca"
+    )
+    resultado["retorno_pct"] = resultado.apply(
+        lambda r: (r["ultimo"] / r["cotacao_atual"] * 100)
+        if r["cotacao_atual"] > 0 else 0,
+        axis=1,
+    )
+    resultado["retorno_equiv_mensal_pct"] = resultado.apply(
+        lambda r: (r["retorno_pct"] * 21 / r["dias_uteis"])
+        if r["dias_uteis"] > 0 else r["retorno_pct"],
+        axis=1,
+    )
+    resultado["venda_efetiva_pct"] = resultado.apply(
+        lambda r: ((r["venda_efetiva_call"] / r["cotacao_atual"]) - 1) * 100
+        if r["cotacao_atual"] > 0 else 0,
+        axis=1,
+    )
+    resultado["precisa_subir_pct"] = resultado["distancia_pct"]
+    resultado["custo_efetivo_pct"] = resultado.apply(
+        lambda r: ((r["preco_efetivo_put"] / r["cotacao_atual"]) - 1) * 100
+        if r["cotacao_atual"] > 0 else 0,
+        axis=1,
+    )
+    return resultado
 
 
 def badge_diag(diag):
@@ -1406,6 +1487,7 @@ with aba_oportunidades:
             dados = dados[dados["mes"] == mes_nome]
 
             st.session_state.dados = dados
+            st.session_state.cotacoes_manuais = {}
             st.session_state.vencimento_carregado = mes_busca_rotulo
             st.session_state.incluiu_semanais = incluir_semanais
             semanais_encontradas = dados[
@@ -1424,14 +1506,75 @@ with aba_oportunidades:
     if "dados" not in st.session_state:
         st.warning("Escolha o vencimento e clique em **Atualizar mercado**.")
     else:
-        df = st.session_state.dados
+        df_base = st.session_state.dados.copy()
         st.divider()
         st.write(f"Mês carregado: **{st.session_state.get('vencimento_carregado', 'Indefinido')}**")
-        st.write(f"Opções analisadas: **{len(df)}**")
+        st.write(f"Opções analisadas: **{len(df_base)}**")
 
-        if df.empty:
+        if df_base.empty:
             st.warning("Nenhuma opção encontrada para esse vencimento.")
         else:
+            if "cotacao_site" not in df_base.columns:
+                df_base["cotacao_site"] = df_base["cotacao_atual"]
+            if "cotacoes_manuais" not in st.session_state:
+                st.session_state.cotacoes_manuais = {}
+
+            ativos_cotacao = sorted(
+                df_base["ativo"].dropna().astype(str).str.upper().unique().tolist()
+            )
+            with st.expander("✏️ Atualizar cotação das ações — opcional"):
+                st.caption(
+                    "Use a cotação atual da corretora para recalcular distância do "
+                    "strike, retorno e parecer. O prêmio e o Delta permanecem os do "
+                    "fechamento coletado na Opções.Net."
+                )
+                valores_digitados = {}
+                with st.form("form_cotacoes_manuais"):
+                    colunas_cotacao = st.columns(min(len(ativos_cotacao), 4))
+                    for indice, ativo in enumerate(ativos_cotacao):
+                        linhas_ativo = df_base[df_base["ativo"] == ativo]
+                        cotacao_site = float(linhas_ativo["cotacao_site"].median())
+                        cotacao_inicial = float(
+                            st.session_state.cotacoes_manuais.get(ativo, cotacao_site)
+                        )
+                        with colunas_cotacao[indice % len(colunas_cotacao)]:
+                            st.caption(f"{ativo} · site: {fmt_rs(cotacao_site)}")
+                            valores_digitados[ativo] = st.number_input(
+                                f"Cotação atual de {ativo}",
+                                min_value=0.01,
+                                value=cotacao_inicial,
+                                step=0.01,
+                                format="%.2f",
+                            )
+                    aplicar_cotacoes = st.form_submit_button(
+                        "Aplicar cotações informadas",
+                        type="primary",
+                    )
+
+                if aplicar_cotacoes:
+                    st.session_state.cotacoes_manuais = valores_digitados
+                    st.rerun()
+
+                if st.session_state.cotacoes_manuais:
+                    if st.button("Voltar às cotações da Opções.Net"):
+                        st.session_state.cotacoes_manuais = {}
+                        st.rerun()
+
+            df = aplicar_cotacoes_manuais(
+                df_base,
+                st.session_state.get("cotacoes_manuais", {}),
+            )
+            cotacoes_aplicadas = st.session_state.get("cotacoes_manuais", {})
+            if cotacoes_aplicadas:
+                resumo_cotacoes = " · ".join(
+                    f"{ativo}: {fmt_rs(valor)}"
+                    for ativo, valor in sorted(cotacoes_aplicadas.items())
+                )
+                st.info(
+                    f"Cotações manuais aplicadas — {resumo_cotacoes}. "
+                    "Prêmios e Deltas permanecem os do fechamento anterior."
+                )
+
             empresas_disponiveis = sorted(df["ativo"].dropna().astype(str).unique().tolist())
             empresa_visualizada = st.selectbox(
                 "Empresa para visualizar:",
@@ -1505,8 +1648,8 @@ with aba_oportunidades:
                 calls_todas = calls_todas.sort_values("negocios", ascending=False)
                 puts_todas = puts_todas.sort_values("negocios", ascending=False)
 
-            calls = calls_todas.head(10).copy()
-            puts = puts_todas.head(10).copy()
+            calls = calls_todas.copy()
+            puts = puts_todas.copy()
 
             for tabela_op in (calls, puts):
                 tabela_op["Retorno"] = tabela_op["retorno_pct"].map(lambda x: f"{x:.2f}%".replace(".", ","))
@@ -1532,7 +1675,7 @@ with aba_oportunidades:
             col_call, col_put = st.columns(2)
 
             with col_call:
-                st.subheader("💜 CALLs")
+                st.subheader(f"💜 CALLs · {len(calls)} opções")
                 if calls.empty:
                     st.warning("Nenhuma CALL encontrada.")
                     cod_call = None
@@ -1546,17 +1689,21 @@ with aba_oportunidades:
                         use_container_width=True,
                         hide_index=True,
                     )
-                    opcoes_call = calls_todas.sort_values(["ativo", "strike"])["codigo"].drop_duplicates().tolist()
+                    opcoes_call = calls.sort_values(
+                        ["ativo", "strike"]
+                    )["codigo"].drop_duplicates().tolist()
                     cod_call = st.selectbox("Selecionar CALL para o Parecer", opcoes_call, key="sel_call")
 
             with col_put:
                 objetivo_put = "Gerar renda"
                 if puts.empty:
-                    st.subheader("🟢 PUTs")
+                    st.subheader("🟢 PUTs · 0 opções")
                     st.warning("Nenhuma PUT encontrada.")
                     cod_put = None
                 else:
-                    opcoes_put = puts_todas.sort_values(["ativo", "strike"])["codigo"].drop_duplicates().tolist()
+                    opcoes_put = puts.sort_values(
+                        ["ativo", "strike"]
+                    )["codigo"].drop_duplicates().tolist()
                     codigo_put_atual = st.session_state.get("sel_put", opcoes_put[0])
                     if codigo_put_atual not in opcoes_put:
                         codigo_put_atual = opcoes_put[0]
@@ -1567,7 +1714,7 @@ with aba_oportunidades:
                         <div style="display:flex;align-items:center;justify-content:space-between;
                                     gap:12px;margin:0 0 12px 0;flex-wrap:nowrap;">
                             <div style="font-size:1.75rem;font-weight:700;white-space:nowrap;">
-                                🟢 PUTs
+                                🟢 PUTs · {len(puts)} opções
                             </div>
                             <div style="font-size:1.15rem;font-weight:700;color:#344054;
                                         text-align:right;white-space:nowrap;">
