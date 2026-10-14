@@ -1,0 +1,2120 @@
+import time
+import re
+import unicodedata
+from datetime import date, datetime
+from pathlib import Path
+from uuid import uuid4
+
+import pandas as pd
+import streamlit as st
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+
+
+
+st.set_page_config(page_title="Método PUT + CALL", layout="wide")
+
+VERSAO_APP = "4.17.0 · revisão de dados"
+
+ARQUIVO_OPERACOES = Path("operacoes_abertas.csv")
+
+COLUNAS = {
+    0: "codigo", 1: "check", 2: "estilo", 3: "strike",
+    4: "situacao", 5: "distancia_pct", 6: "ultimo", 7: "variacao_pct",
+    8: "data_ultimo_negocio", 9: "negocios", 10: "volume",
+    11: "volatilidade", 12: "delta", 13: "gamma", 14: "theta",
+    15: "theta_pct", 16: "vega", 17: "iq",
+}
+
+MESES = {
+    "A": "Jan", "B": "Fev", "C": "Mar", "D": "Abr", "E": "Mai", "F": "Jun",
+    "G": "Jul", "H": "Ago", "I": "Set", "J": "Out", "K": "Nov", "L": "Dez",
+    "M": "Jan", "N": "Fev", "O": "Mar", "P": "Abr", "Q": "Mai", "R": "Jun",
+    "S": "Jul", "T": "Ago", "U": "Set", "V": "Out", "W": "Nov", "X": "Dez",
+}
+
+VENCIMENTOS_OPCOESNET = {
+    "Vencimento atual": None,
+    "Jul - 17/07": "17/07",
+    "Ago - 21/08": "21/08",
+    "Set - 18/09": "18/09",
+    "Out - 16/10": "16/10",
+    "Nov - 19/11": "19/11",
+    "Dez - 18/12": "18/12",
+}
+
+NOMES_MESES = {
+    1: "Jan", 2: "Fev", 3: "Mar", 4: "Abr", 5: "Mai", 6: "Jun",
+    7: "Jul", 8: "Ago", 9: "Set", 10: "Out", 11: "Nov", 12: "Dez",
+}
+
+COLUNAS_OPERACOES = [
+    "id", "data_abertura", "ativo_base", "codigo", "tipo", "strike",
+    "premio_recebido", "quantidade", "vencimento", "cotacao_atual_manual",
+    "status", "observacao"
+]
+
+
+def moeda_para_float(x):
+    try:
+        texto = str(x).strip()
+        if texto == "" or texto.lower() == "nan":
+            return 0.0
+        return float(
+            texto.replace("R$", "")
+            .replace(".", "")
+            .replace(",", ".")
+            .replace("+", "")
+            .replace("−", "-")
+            .replace("%", "")
+            .strip()
+        )
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def numero_opcional(x):
+    """Preserva ausências de dados: um campo vazio não é zero."""
+    if x is None or pd.isna(x) or str(x).strip().lower() in {"", "nan", "none", "n/d", "-", "—"}:
+        return float("nan")
+    try:
+        valor = moeda_para_float(x)
+        return valor if -1 <= valor <= 1 else float("nan")
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def atualizar_qualidade_dados(df):
+    """Avalia delta e atualidade sem modificar preços ou gregas originais."""
+    df = df.copy()
+    if "delta" not in df:
+        df["delta"] = float("nan")
+    df["delta"] = pd.to_numeric(df["delta"], errors="coerce")
+    # Delta exatamente zero em contrato negociado pode indicar campo vazio ou erro de captura.
+    df["delta_valido"] = df["delta"].notna() & df["delta"].between(-1, 1) & (df["delta"].abs() > 0.000001)
+    df["chance_exercicio_pct"] = df["delta"].where(df["delta_valido"]).abs() * 100
+    datas = pd.to_datetime(df.get("data_ultimo_negocio", pd.Series(index=df.index, dtype="object")), dayfirst=True, errors="coerce")
+    df["data_negocio_dt"] = datas
+    # Usa a data mais recente efetivamente observada na coleta como referência de pregão.
+    referencia = datas.max()
+    df["data_referencia_pregao"] = referencia.strftime("%d/%m/%Y") if pd.notna(referencia) else "N/D"
+    df["cotacao_antiga"] = datas.isna() | (datas < referencia) if pd.notna(referencia) else pd.Series(True, index=df.index)
+    df["status_dados"] = df.apply(lambda r: (
+        "⚠️ Delta N/D; último negócio antigo" if not r["delta_valido"] and r["cotacao_antiga"] else
+        "⚠️ Delta N/D" if not r["delta_valido"] else
+        "⚠️ Último negócio antigo" if r["cotacao_antiga"] else "✓ Dados completos"
+    ), axis=1)
+    df["apta_ranking"] = df["delta_valido"] & ~df["cotacao_antiga"]
+    return df
+
+
+def ordenar_oportunidades(df, col, crescente=False):
+    """Sempre apresenta registros completos primeiro; preserva os demais para inspeção."""
+    return df.sort_values(["apta_ranking", col], ascending=[False, crescente], na_position="last", kind="stable")
+
+
+def fmt_rs(x):
+    try:
+        return f"R$ {float(x):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except (TypeError, ValueError):
+        return "R$ 0,00"
+
+
+def fmt_pct(x):
+    try:
+        return f"{float(x):.1f}%".replace(".", ",")
+    except (TypeError, ValueError):
+        return "0,0%"
+
+
+def normalizar_codigo(codigo):
+    """Padroniza tickers e remove espaços/caracteres invisíveis."""
+    return "".join(
+        caractere for caractere in str(codigo).upper().strip()
+        if caractere.isalnum()
+    )
+
+
+def mes_opcao(codigo):
+    try:
+        letra = str(codigo).strip().upper()[4]
+        return MESES.get(letra, "Indef.")
+    except (IndexError, TypeError):
+        return "Indef."
+
+
+def normalizar_texto(texto):
+    texto = unicodedata.normalize("NFKD", str(texto))
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", texto).strip().lower()
+
+
+def identificar_cabecalho(texto, ocorrencias):
+    """Converte os títulos visíveis do Opções.Net nos nomes usados pelo app."""
+    titulo = normalizar_texto(texto)
+    if not titulo:
+        return None
+    if "ticker" in titulo:
+        return "codigo"
+    if "vencimento" in titulo:
+        return "vencimento_opcao"
+    if "dias" in titulo and ("uteis" in titulo or "úteis" in str(texto).lower()):
+        return "dias_uteis"
+    if titulo in {"f.m.", "fm"}:
+        return "check"
+    if titulo.startswith("mod"):
+        return "estilo"
+    if "strike" == titulo:
+        return "strike"
+    if "ai/otm" in titulo or "a/i/otm" in titulo:
+        return "situacao"
+    if "dist" in titulo and "strike" in titulo:
+        return "distancia_pct"
+    if titulo.startswith("ultimo"):
+        return "ultimo"
+    if titulo.startswith("var"):
+        return "variacao_pct"
+    if "data/hora" in titulo or ("data" in titulo and "hora" in titulo):
+        return "data_ultimo_negocio"
+    if ("num" in titulo or "núm" in str(texto).lower()) and "neg" in titulo:
+        return "negocios"
+    if "vol" in titulo and "financeiro" in titulo:
+        return "volume"
+    if "vol" in titulo and "impl" in titulo:
+        return "volatilidade"
+    if titulo == "delta":
+        return "delta"
+    if titulo == "gamma":
+        return "gamma"
+    if titulo.startswith("theta"):
+        ocorrencias["theta"] = ocorrencias.get("theta", 0) + 1
+        if "%" in str(texto) or ocorrencias["theta"] > 1:
+            return "theta_pct"
+        return "theta"
+    if titulo == "vega":
+        return "vega"
+    if titulo == "iq":
+        return "iq"
+    if titulo.startswith("lambda"):
+        return "lambda"
+    return None
+
+
+def proximos_meses(quantidade=9):
+    """Gera os meses de busca sem manter datas fixas no código."""
+    hoje = date.today()
+    meses = []
+    ano, mes = hoje.year, hoje.month
+    for _ in range(quantidade):
+        rotulo = f"{NOMES_MESES[mes]}/{ano}"
+        meses.append((rotulo, mes, ano))
+        mes += 1
+        if mes == 13:
+            mes = 1
+            ano += 1
+    return meses
+
+
+def criar_driver():
+    options = Options()
+
+    options.binary_location = "/usr/bin/chromium"
+
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--remote-debugging-pipe")
+
+    service = Service(
+        executable_path="/usr/bin/chromedriver"
+    )
+
+    return webdriver.Chrome(
+        service=service,
+        options=options
+    )
+
+
+def mapear_linha_opcoes(dados):
+    """
+    Mapeia uma linha pela sequência estrutural da grade.
+
+    O Opções.Net pode exibir ou ocultar Vencimento e Dias úteis e também
+    inserir uma coluna técnica vazia depois do ticker. Por isso, o ponto de
+    referência mais confiável é a sequência:
+    Mod. (A/E) -> Strike -> AI/OTM (ITM/ATM/OTM).
+    """
+    if not dados:
+        return {}
+
+    indice_situacao = None
+    for indice, valor in enumerate(dados[:12]):
+        if normalizar_texto(valor).upper() in {"ITM", "ATM", "OTM"}:
+            indice_situacao = indice
+            break
+
+    if indice_situacao is None or indice_situacao < 2:
+        return {}
+
+    indice_strike = indice_situacao - 1
+    indice_estilo = indice_situacao - 2
+    strike = moeda_para_float(dados[indice_strike])
+    estilo = normalizar_texto(dados[indice_estilo]).upper()
+    if strike <= 0 or estilo not in {"A", "E"}:
+        return {}
+
+    registro = {
+        "codigo": dados[0],
+        "estilo": dados[indice_estilo],
+        "strike": dados[indice_strike],
+        "situacao": dados[indice_situacao],
+    }
+
+    # O campo imediatamente anterior ao estilo corresponde ao F.M.
+    if indice_estilo > 0:
+        registro["check"] = dados[indice_estilo - 1]
+
+    # Se a data e o prazo estiverem presentes, identifica-os pelo conteúdo,
+    # sem depender da existência da coluna técnica vazia.
+    for indice in range(1, indice_estilo):
+        if re.fullmatch(r"\d{2}/\d{2}/\d{4}", str(dados[indice]).strip()):
+            registro["vencimento_opcao"] = dados[indice]
+            if indice + 1 < indice_estilo:
+                registro["dias_uteis"] = dados[indice + 1]
+            break
+
+    campos_apos_situacao = [
+        "distancia_pct",
+        "ultimo",
+        "variacao_pct",
+        "data_ultimo_negocio",
+        "negocios",
+        "volume",
+        "volatilidade",
+        "delta",
+        "gamma",
+        "theta",
+        "theta_pct",
+        "vega",
+        "iq",
+    ]
+    for deslocamento, nome in enumerate(campos_apos_situacao, start=1):
+        indice = indice_situacao + deslocamento
+        if indice < len(dados):
+            registro[nome] = dados[indice]
+
+    return registro
+
+
+def extrair_tabela_visivel(driver, ativo, tipo):
+    """
+    Extrai a grade atual do Opções.Net.Br.
+
+    A página atual não traz uma coluna de tipo dentro da tabela;
+    CALL/PUT é definido pelo seletor acima da grade. Por isso o
+    tipo é recebido como argumento e gravado em todas as linhas.
+    """
+
+    registros = []
+    mapa_18 = COLUNAS
+    mapa_20 = {
+        0: "codigo", 1: "vencimento_opcao", 2: "dias_uteis",
+        3: "check", 4: "estilo", 5: "strike", 6: "situacao",
+        7: "distancia_pct", 8: "ultimo", 9: "variacao_pct",
+        10: "data_ultimo_negocio", 11: "negocios", 12: "volume",
+        13: "volatilidade", 14: "delta", 15: "gamma", 16: "theta",
+        17: "theta_pct", 18: "vega", 19: "iq",
+    }
+    mapa_21 = {
+        0: "codigo", 2: "vencimento_opcao", 3: "dias_uteis",
+        4: "check", 5: "estilo", 6: "strike", 7: "situacao",
+        8: "distancia_pct", 9: "ultimo", 10: "variacao_pct",
+        11: "data_ultimo_negocio", 12: "negocios", 13: "volume",
+        14: "volatilidade", 15: "delta", 16: "gamma", 17: "theta",
+        18: "theta_pct", 19: "vega", 20: "iq",
+    }
+
+    for tabela in driver.find_elements(By.TAG_NAME, "table"):
+
+        try:
+            if not tabela.is_displayed():
+                continue
+        except Exception:
+            continue
+
+        cabecalhos_brutos = [
+            th.text.strip() for th in tabela.find_elements(By.TAG_NAME, "th")
+        ]
+        ocorrencias = {}
+        cabecalhos = [
+            identificar_cabecalho(texto, ocorrencias)
+            for texto in cabecalhos_brutos
+        ]
+
+        for row in tabela.find_elements(By.TAG_NAME, "tr"):
+            cols = row.find_elements(By.TAG_NAME, "td")
+            dados = [c.text.strip() for c in cols]
+            if not dados or len(dados) < 4:
+                continue
+
+            # A sequência estrutural é usada primeiro porque a página pode
+            # ter cabeçalhos sem a coluna técnica existente no corpo.
+            registro = mapear_linha_opcoes(dados)
+
+            codigo = normalizar_codigo(registro.get("codigo", ""))
+            strike_valido = moeda_para_float(registro.get("strike", "")) > 0
+
+            # Contingência para uma eventual versão sem a sequência
+            # Mod. -> Strike -> AI/OTM.
+            if not codigo or not strike_valido:
+                registro = {}
+                for indice, valor in enumerate(dados):
+                    if indice < len(cabecalhos) and cabecalhos[indice]:
+                        registro[cabecalhos[indice]] = valor
+                codigo = normalizar_codigo(registro.get("codigo", ""))
+                strike_valido = moeda_para_float(registro.get("strike", "")) > 0
+
+            if not codigo or not strike_valido:
+                if len(dados) == 18:
+                    mapa = mapa_18
+                elif len(dados) == 20:
+                    mapa = mapa_20
+                elif len(dados) >= 21:
+                    mapa = mapa_21
+                else:
+                    mapa = {}
+                registro = {
+                    nome: dados[indice]
+                    for indice, nome in mapa.items()
+                    if indice < len(dados)
+                }
+                codigo = normalizar_codigo(registro.get("codigo", ""))
+                strike_valido = moeda_para_float(registro.get("strike", "")) > 0
+
+            ultimo = moeda_para_float(registro.get("ultimo", ""))
+            distancia = moeda_para_float(registro.get("distancia_pct", ""))
+            codigo_do_ativo = codigo.startswith(normalizar_codigo(ativo)[:4])
+            valores_coerentes = ultimo >= 0 and -100 < distancia < 100
+
+            if (
+                codigo
+                and any(c.isdigit() for c in codigo)
+                and codigo_do_ativo
+                and strike_valido
+                and valores_coerentes
+            ):
+                registros.append(registro)
+
+    colunas_finais = [
+        "ativo",
+        "codigo",
+        "tipo",
+        "vencimento_opcao",
+        "dias_uteis",
+        "estilo",
+        "strike",
+        "situacao",
+        "distancia_pct",
+        "ultimo",
+        "variacao_pct",
+        "data_ultimo_negocio",
+        "negocios",
+        "volume",
+        "volatilidade",
+        "delta",
+        "gamma",
+        "theta",
+        "vega",
+        "lambda",
+    ]
+
+    if not registros:
+        return pd.DataFrame(columns=colunas_finais)
+
+    df = pd.DataFrame(registros)
+
+    # Garante que existam todas as colunas
+    for c in colunas_finais:
+        if c not in df.columns:
+            df[c] = ""
+
+    df["ativo"] = ativo
+    df["tipo"] = tipo
+
+    return df[colunas_finais]
+
+def selecionar_tipo(driver, tipo):
+    alvo = "CALLs" if tipo == "CALL" else "PUTs"
+
+    # Primeiro tenta clicar no label que contém o radio.
+    try:
+        for label in driver.find_elements(By.XPATH, "//label"):
+            if alvo.lower() in label.text.strip().lower():
+                try:
+                    radio = label.find_element(By.XPATH, ".//input[@type='radio']")
+                    if not radio.is_selected():
+                        driver.execute_script("arguments[0].click();", radio)
+                    time.sleep(2)
+                    return True
+                except Exception:
+                    driver.execute_script("arguments[0].click();", label)
+                    time.sleep(2)
+                    return True
+    except Exception:
+        pass
+
+    # Fallback: procura qualquer elemento visível com o texto.
+    try:
+        elementos = driver.find_elements(
+            By.XPATH,
+            f"//*[translate(normalize-space(text()), 'abcdefghijklmnopqrstuvwxyz', "
+            f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ')='{alvo.upper()}']"
+        )
+        for el in elementos:
+            try:
+                if el.is_displayed():
+                    driver.execute_script("arguments[0].click();", el)
+                    time.sleep(2)
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return False
+
+
+def selecionar_vencimento(driver, vencimento_texto):
+    if vencimento_texto is None:
+        return True
+
+    try:
+        time.sleep(3)
+
+        # Procura o elemento de texto mais específico do vencimento
+        textos = driver.find_elements(
+            By.XPATH,
+            f"//*[contains(normalize-space(text()), '{vencimento_texto}')]"
+        )
+
+        for texto in textos:
+            try:
+                if not texto.is_displayed():
+                    continue
+
+                # Procura o checkbox imediatamente anterior ao texto
+                checkbox = texto.find_element(
+                    By.XPATH,
+                    "./preceding::input[@type='checkbox'][1]"
+                )
+
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});",
+                    checkbox
+                )
+
+                if not checkbox.is_selected():
+                    driver.execute_script(
+                        "arguments[0].click();",
+                        checkbox
+                    )
+
+                time.sleep(5)
+                return checkbox.is_selected()
+
+            except Exception:
+                continue
+
+    except Exception as e:
+        print(f"Erro ao selecionar {vencimento_texto}: {e}")
+
+    return False
+
+
+def texto_checkbox_vencimento(driver, checkbox):
+    """Obtém apenas o rótulo associado ao checkbox, mesmo com HTML variável."""
+    return driver.execute_script(
+        """
+        const el = arguments[0];
+        const textos = [];
+        const adicionar = (item) => {
+            if (!item) return;
+            const valor = (item.innerText || item.textContent || "").trim();
+            if (valor) textos.push(valor);
+        };
+
+        if (el.id) {
+            try {
+                adicionar(document.querySelector(`label[for="${CSS.escape(el.id)}"]`));
+            } catch (e) {}
+        }
+        adicionar(el.closest("label"));
+        adicionar(el.nextElementSibling);
+        if (el.nextSibling && el.nextSibling.textContent) {
+            textos.push(el.nextSibling.textContent.trim());
+        }
+        adicionar(el.parentElement);
+
+        // Prefere um fragmento que contenha uma única data.
+        for (const texto of textos) {
+            const datas = texto.match(/\\d{2}\\/\\d{2}(?:\\/\\d{4})?/g) || [];
+            if (datas.length === 1) return texto;
+        }
+        return "";
+        """,
+        checkbox,
+    )
+
+
+def listar_vencimentos_pagina(driver):
+    """Lê os vencimentos realmente oferecidos para o ativo na página."""
+    encontrados = []
+    for checkbox in driver.find_elements(By.XPATH, "//input[@type='checkbox']"):
+        try:
+            texto = texto_checkbox_vencimento(driver, checkbox)
+            texto = re.sub(r"\s+", " ", str(texto)).strip()
+            data_match = re.search(r"(\d{2})/(\d{2})(?:/(\d{4}))?", texto)
+            if not data_match:
+                continue
+            semana_match = re.search(r"\bW([1-5])\b", texto, flags=re.IGNORECASE)
+            dias_match = re.search(r"(\d+)\s*d\.?\s*u\.?", texto, flags=re.IGNORECASE)
+            encontrados.append(
+                {
+                    "dia": int(data_match.group(1)),
+                    "mes": int(data_match.group(2)),
+                    "ano_texto": int(data_match.group(3)) if data_match.group(3) else None,
+                    "semanal": bool(semana_match),
+                    "semana": int(semana_match.group(1)) if semana_match else None,
+                    "dias_uteis": int(dias_match.group(1)) if dias_match else None,
+                    "texto": texto,
+                    "selecionado": checkbox.is_selected(),
+                }
+            )
+        except Exception:
+            continue
+    return encontrados
+
+
+def ajustar_checkbox_vencimento(driver, referencia, selecionar):
+    """Refaz a busca antes de cada clique para evitar elementos obsoletos."""
+    for checkbox in driver.find_elements(By.XPATH, "//input[@type='checkbox']"):
+        try:
+            texto = texto_checkbox_vencimento(driver, checkbox)
+            texto_normalizado = re.sub(r"\s+", " ", str(texto)).strip()
+            data_match = re.search(r"(\d{2})/(\d{2})", texto_normalizado)
+            if not data_match:
+                continue
+            semanal = bool(re.search(r"\bW[1-5]\b", texto_normalizado, flags=re.IGNORECASE))
+            mesma_data = (
+                int(data_match.group(1)) == referencia["dia"]
+                and int(data_match.group(2)) == referencia["mes"]
+            )
+            if mesma_data and semanal == referencia["semanal"]:
+                if checkbox.is_selected() != selecionar:
+                    driver.execute_script("arguments[0].click();", checkbox)
+                    time.sleep(1)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def configurar_vencimentos(
+    driver, mes_num, ano, incluir_semanais=False, data_exata=None
+):
+    """Identifica o mensal e, opcionalmente, as semanais existentes no mês."""
+    time.sleep(2)
+    disponiveis = listar_vencimentos_pagina(driver)
+    if not disponiveis:
+        return []
+
+    if data_exata:
+        try:
+            dia_alvo, mes_alvo = [int(x) for x in data_exata[:5].split("/")]
+        except (TypeError, ValueError):
+            return []
+        desejados = [
+            item for item in disponiveis
+            if item["dia"] == dia_alvo and item["mes"] == mes_alvo
+        ]
+    else:
+        desejados = [
+            item for item in disponiveis
+            if item["mes"] == mes_num
+            and (incluir_semanais or not item["semanal"])
+        ]
+
+    # Limpa somente os checkboxes reconhecidos como vencimentos.
+    for item in disponiveis:
+        if item["selecionado"]:
+            ajustar_checkbox_vencimento(driver, item, False)
+
+    vencimentos_alvo = []
+    hoje = date.today()
+    for item in desejados:
+        ano_item = item["ano_texto"] or ano
+        try:
+            data_item = date(ano_item, item["mes"], item["dia"])
+        except ValueError:
+            continue
+        if not data_exata and data_item < hoje:
+            continue
+        vencimentos_alvo.append(
+            {
+                **item,
+                "ano": ano_item,
+                "data": data_item.strftime("%d/%m/%Y"),
+                "tipo_vencimento": "Semanal" if item["semanal"] else "Mensal",
+            }
+        )
+
+    return sorted(
+        vencimentos_alvo,
+        key=lambda item: (item["ano"], item["mes"], item["dia"]),
+    )
+
+
+def selecionar_apenas_um_vencimento(driver, vencimento):
+    """
+    Mantém somente um vencimento marcado.
+
+    A grade do Opções.Net muda de estrutura quando vários vencimentos são
+    exibidos ao mesmo tempo. A coleta individual preserva o formato estável
+    da tabela e os resultados são reunidos depois pelo app.
+    """
+    disponiveis = listar_vencimentos_pagina(driver)
+    for item in disponiveis:
+        if item["selecionado"]:
+            ajustar_checkbox_vencimento(driver, item, False)
+
+    selecionado = ajustar_checkbox_vencimento(driver, vencimento, True)
+    if selecionado:
+        time.sleep(4)
+    return selecionado
+
+def aceitar_dados_fechamento(driver):
+    textos = [
+        "Continuar com dados de fechamento",
+        "Continuar",
+        "Aceitar",
+        "OK",
+    ]
+
+    for texto in textos:
+        try:
+            elementos = driver.find_elements(
+                By.XPATH,
+                f"//*[contains(normalize-space(text()), '{texto}')]"
+            )
+
+            for elemento in elementos:
+                try:
+                    if elemento.is_displayed() and elemento.is_enabled():
+                        driver.execute_script(
+                            "arguments[0].click();",
+                            elemento
+                        )
+                        time.sleep(2)
+                        return True
+                except:
+                    pass
+
+        except:
+            pass
+
+    return False
+
+
+def coletar_opcoes(
+    ativo,
+    vencimento_escolhido=None,
+    mes_num=None,
+    ano=None,
+    incluir_semanais=False,
+    data_exata=None,
+):
+    url = f"https://opcoes.net.br/opcoes/bovespa/{ativo}"
+    driver = None
+    try:
+        driver = criar_driver()
+        driver.get(url)
+        time.sleep(7)
+        aceitar_dados_fechamento(driver)
+
+        if data_exata is None and vencimento_escolhido:
+            data_exata = VENCIMENTOS_OPCOESNET.get(vencimento_escolhido)
+
+        if data_exata and mes_num is None:
+            try:
+                mes_num = int(data_exata.split("/")[1])
+            except (IndexError, ValueError):
+                mes_num = date.today().month
+        mes_num = mes_num or date.today().month
+        ano = ano or date.today().year
+
+        vencimentos_selecionados = configurar_vencimentos(
+            driver,
+            mes_num=mes_num,
+            ano=ano,
+            incluir_semanais=incluir_semanais,
+            data_exata=data_exata,
+        )
+        if not vencimentos_selecionados:
+            raise ValueError(
+                f"Nenhum vencimento disponível foi reconhecido para {ativo} "
+                f"no mês {mes_num:02d}/{ano}."
+            )
+
+        partes = []
+        for vencimento in vencimentos_selecionados:
+            if not selecionar_apenas_um_vencimento(driver, vencimento):
+                continue
+
+            houve_leitura = False
+            for tipo in ["CALL", "PUT"]:
+                if selecionar_tipo(driver, tipo):
+                    parte = extrair_tabela_visivel(driver, ativo, tipo)
+                    if not parte.empty:
+                        # Como a coleta é feita com apenas um vencimento
+                        # selecionado, estes dados são inequívocos mesmo que
+                        # a grade omita as colunas de data e prazo.
+                        parte["vencimento_opcao"] = vencimento["data"]
+                        parte["dias_uteis"] = vencimento["dias_uteis"] or ""
+                        partes.append(parte)
+                        houve_leitura = True
+
+        if not partes:
+            raise ValueError(
+                f"Foram encontrados {len(vencimentos_selecionados)} vencimento(s) "
+                f"para {ativo}, mas a grade individual de CALLs e PUTs não pôde "
+                "ser lida."
+            )
+
+        return pd.concat(partes, ignore_index=True).drop_duplicates(
+            subset=["ativo", "codigo", "tipo", "vencimento_opcao"], keep="first"
+        )
+    finally:
+        if driver is not None:
+            driver.quit()
+
+
+def preparar(df):
+    df = df.copy()
+    for coluna in ["vencimento_opcao", "dias_uteis"]:
+        if coluna not in df.columns:
+            df[coluna] = ""
+    for col in [
+        "strike", "distancia_pct", "ultimo", "variacao_pct", "negocios", "volume",
+        "volatilidade", "delta", "gamma", "theta", "vega", "lambda"
+    ]:
+        df[col] = df[col].apply(numero_opcional if col == "delta" else moeda_para_float)
+
+    df["codigo"] = df["codigo"].apply(normalizar_codigo)
+    df["tipo"] = df["tipo"].astype(str).str.upper().str.strip()
+    df["dias_uteis"] = df["dias_uteis"].apply(moeda_para_float).astype(int)
+
+    # Linhas sem prêmio negociado não representam uma oportunidade executável.
+    # As demais barreiras impedem que um eventual desalinhamento da página
+    # produza percentuais absurdos no parecer.
+    df = df[
+        (df["strike"] > 0)
+        & (df["ultimo"] > 0)
+        & (df["distancia_pct"] > -100)
+        & (df["distancia_pct"] < 100)
+    ].copy()
+    df["tipo_vencimento"] = df["codigo"].apply(
+        lambda codigo: "Semanal"
+        if re.search(r"W[1-5]$", normalizar_codigo(codigo))
+        else "Mensal"
+    )
+    df["mes"] = df["codigo"].apply(mes_opcao)
+    df["premio_total"] = df["ultimo"] * 100
+    df["preco_efetivo_put"] = df["strike"] - df["ultimo"]
+    df["venda_efetiva_call"] = df["strike"] + df["ultimo"]
+    df["cotacao_atual"] = df.apply(
+        lambda row: row["strike"] / (1 + row["distancia_pct"] / 100)
+        if row["distancia_pct"] != -100 else 0,
+        axis=1
+    )
+    df["score_premio"] = df["premio_total"].apply(
+        lambda x: 4 if x >= 80 else 3 if x >= 40 else 2 if x >= 15 else 1
+    )
+    df["score_liquidez"] = df["negocios"].apply(
+        lambda x: 4 if x >= 20 else 3 if x >= 5 else 2 if x >= 1 else 1
+    )
+    df["score_distancia"] = abs(df["distancia_pct"]).apply(
+        lambda x: 4 if x >= 3 else 3 if x >= 1.5 else 2 if x >= 0.5 else 1
+    )
+    df["score_total"] = df["score_premio"] + df["score_liquidez"] + df["score_distancia"]
+    df["diagnostico"] = df["score_total"].apply(
+        lambda x: "Muito boa" if x >= 10 else "Boa" if x >= 8 else "Regular" if x >= 6 else "Fraca"
+    )
+
+    # Indicadores objetivos usados na comparação das oportunidades.
+    df = atualizar_qualidade_dados(df)
+    df.loc[~df["apta_ranking"], "diagnostico"] = "Dados a conferir"
+    df["retorno_pct"] = df.apply(
+        lambda r: (r["ultimo"] / r["cotacao_atual"] * 100)
+        if r["cotacao_atual"] > 0 else 0,
+        axis=1,
+    )
+    df["retorno_equiv_mensal_pct"] = df.apply(
+        lambda r: (r["retorno_pct"] * 21 / r["dias_uteis"])
+        if r["dias_uteis"] > 0 else r["retorno_pct"],
+        axis=1,
+    )
+    df["venda_efetiva_pct"] = df.apply(
+        lambda r: ((r["venda_efetiva_call"] / r["cotacao_atual"]) - 1) * 100
+        if r["cotacao_atual"] > 0 else 0,
+        axis=1,
+    )
+    df["precisa_subir_pct"] = df["distancia_pct"]
+    df["custo_efetivo_pct"] = df.apply(
+        lambda r: ((r["preco_efetivo_put"] / r["cotacao_atual"]) - 1) * 100
+        if r["cotacao_atual"] > 0 else 0,
+        axis=1,
+    )
+    df["cotacao_site"] = df["cotacao_atual"]
+    df["distancia_pct_site"] = df["distancia_pct"]
+    df["cotacao_manual"] = False
+    return df
+
+
+def aplicar_cotacoes_manuais(df, cotacoes_manuais=None):
+    """Recalcula indicadores da ação sem alterar prêmio e Delta coletados."""
+    resultado = df.copy()
+    cotacoes_manuais = cotacoes_manuais or {}
+    if "cotacao_site" not in resultado.columns:
+        resultado["cotacao_site"] = resultado["cotacao_atual"]
+    resultado["cotacao_atual"] = resultado["cotacao_site"]
+    resultado["cotacao_manual"] = False
+
+    for ativo, cotacao in cotacoes_manuais.items():
+        try:
+            valor = float(cotacao)
+        except (TypeError, ValueError):
+            continue
+        if valor > 0:
+            mascara = (
+                resultado["ativo"].astype(str).str.upper().str.strip()
+                == str(ativo).upper().strip()
+            )
+            resultado.loc[mascara, "cotacao_atual"] = valor
+            resultado.loc[mascara, "cotacao_manual"] = True
+
+    resultado["distancia_pct"] = resultado.apply(
+        lambda r: ((r["strike"] / r["cotacao_atual"]) - 1) * 100
+        if r["cotacao_atual"] > 0 else 0,
+        axis=1,
+    )
+    resultado["situacao"] = resultado.apply(
+        lambda r: (
+            "ATM"
+            if abs(r["distancia_pct"]) <= 0.5
+            else (
+                "OTM"
+                if (
+                    (r["tipo"] == "CALL" and r["distancia_pct"] > 0)
+                    or (r["tipo"] == "PUT" and r["distancia_pct"] < 0)
+                )
+                else "ITM"
+            )
+        ),
+        axis=1,
+    )
+    resultado["score_distancia"] = abs(resultado["distancia_pct"]).apply(
+        lambda x: 4 if x >= 3 else 3 if x >= 1.5 else 2 if x >= 0.5 else 1
+    )
+    resultado["score_total"] = (
+        resultado["score_premio"]
+        + resultado["score_liquidez"]
+        + resultado["score_distancia"]
+    )
+    resultado["diagnostico"] = resultado["score_total"].apply(
+        lambda x: "Muito boa"
+        if x >= 10 else "Boa" if x >= 8 else "Regular" if x >= 6 else "Fraca"
+    )
+    resultado.loc[~resultado["apta_ranking"], "diagnostico"] = "Dados a conferir"
+    resultado["retorno_pct"] = resultado.apply(
+        lambda r: (r["ultimo"] / r["cotacao_atual"] * 100)
+        if r["cotacao_atual"] > 0 else 0,
+        axis=1,
+    )
+    resultado["retorno_equiv_mensal_pct"] = resultado.apply(
+        lambda r: (r["retorno_pct"] * 21 / r["dias_uteis"])
+        if r["dias_uteis"] > 0 else r["retorno_pct"],
+        axis=1,
+    )
+    resultado["venda_efetiva_pct"] = resultado.apply(
+        lambda r: ((r["venda_efetiva_call"] / r["cotacao_atual"]) - 1) * 100
+        if r["cotacao_atual"] > 0 else 0,
+        axis=1,
+    )
+    resultado["precisa_subir_pct"] = resultado["distancia_pct"]
+    resultado["custo_efetivo_pct"] = resultado.apply(
+        lambda r: ((r["preco_efetivo_put"] / r["cotacao_atual"]) - 1) * 100
+        if r["cotacao_atual"] > 0 else 0,
+        axis=1,
+    )
+    return resultado
+
+
+def badge_diag(diag):
+    cores = {"Muito boa": "🟢", "Boa": "🟡", "Regular": "🟠", "Fraca": "🔴"}
+    return f"{cores.get(diag, '⚪')} {diag}"
+
+
+def classificar_chance_exercicio(delta):
+    """Delta absoluto é proxy de exposição, nunca probabilidade exata."""
+    if delta is None or pd.isna(delta) or abs(float(delta)) < 0.000001:
+        return float("nan"), "N/D — delta ausente", "⚪"
+    chance = min(max(abs(float(delta)) * 100, 0), 100)
+    if chance <= 20:
+        return chance, "Muito baixa", "🟢"
+    if chance <= 40:
+        return chance, "Baixa", "🟢"
+    if chance <= 60:
+        return chance, "Moderada", "🟡"
+    if chance <= 80:
+        return chance, "Alta", "🟠"
+    return chance, "Muito alta", "🔴"
+
+
+def descricao_exercicio_call(distancia):
+    """Texto objetivo sobre o movimento necessário até o strike da CALL."""
+    if distancia > 0:
+        return f"Precisa subir {distancia:.2f}%"
+    if distancia < 0:
+        return f"Strike já foi ultrapassado em {abs(distancia):.2f}%"
+    return "No strike"
+
+def card_diagnostico(op, tipo, objetivo_put="Gerar renda"):
+    """Exibe o parecer da oportunidade em linguagem prática e objetiva."""
+
+    tipo = str(tipo).upper().strip()
+    ativo = str(op["ativo"]).upper().strip()
+    codigo = str(op["codigo"]).upper().strip()
+
+    cotacao = float(op.get("cotacao_atual", 0) or 0)
+    strike = float(op.get("strike", 0) or 0)
+    premio_por_acao = float(op.get("ultimo", 0) or 0)
+    premio_total = float(op.get("premio_total", premio_por_acao * 100) or 0)
+    distancia = float(op.get("distancia_pct", 0) or 0)
+    delta = float(op.get("delta")) if pd.notna(op.get("delta")) else float("nan")
+    negocios = int(float(op.get("negocios", 0) or 0))
+    retorno_pct = float(op.get("retorno_pct", 0) or 0)
+    chance_implicita, chance_texto, chance_icone = classificar_chance_exercicio(delta)
+    chance_exibicao = f"{chance_implicita:.0f}%" if pd.notna(chance_implicita) else "N/D"
+    chance_frase = (f"{chance_texto.lower()} ({chance_implicita:.0f}%)" if pd.notna(chance_implicita)
+                    else "não calculável (delta indisponível)")
+
+    data_vencimento = str(op.get("vencimento_opcao", "") or "").strip()
+    if not data_vencimento:
+        vencimento_carregado = str(st.session_state.get("vencimento_carregado", ""))
+        data_vencimento = (
+            vencimento_carregado.split(" - ", 1)[1]
+            if " - " in vencimento_carregado
+            else vencimento_carregado or "o vencimento"
+        )
+    tipo_vencimento = str(op.get("tipo_vencimento", "Mensal") or "Mensal")
+    dias_uteis = int(float(op.get("dias_uteis", 0) or 0))
+
+    if negocios >= 10:
+        liquidez_texto, liquidez_icone = "Boa", "🟢"
+    elif negocios >= 3:
+        liquidez_texto, liquidez_icone = "Moderada", "🟡"
+    elif negocios >= 1:
+        liquidez_texto, liquidez_icone = "Baixa", "🟠"
+    else:
+        liquidez_texto, liquidez_icone = "Sem negócios observados", "⚪"
+
+    st.markdown(
+        f"""
+        <div style="padding:18px 22px;border:1px solid #dfe5ec;border-radius:16px;
+                    background:#ffffff;margin:4px 0 16px 0;">
+            <div style="font-size:17px;color:#667085;font-weight:600;">Ativo-base</div>
+            <div style="font-size:34px;line-height:1.05;font-weight:800;color:#101828;">{ativo}</div>
+            <div style="margin-top:10px;font-size:16px;color:#667085;">Opção selecionada</div>
+            <div style="font-size:30px;line-height:1.10;font-weight:800;color:#101828;">{codigo}</div>
+            <div style="margin-top:10px;font-size:15px;color:#475467;">
+                {tipo} &nbsp;•&nbsp; Strike {fmt_rs(strike)} &nbsp;•&nbsp;
+                {tipo_vencimento} &nbsp;•&nbsp; Vencimento {data_vencimento}
+                {f"&nbsp;•&nbsp; {dias_uteis} dias úteis" if dias_uteis else ""}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("### Parecer da oportunidade")
+
+    if tipo == "CALL":
+        venda_efetiva = float(op.get("venda_efetiva_call", strike + premio_por_acao) or 0)
+        venda_acima_pct = (
+            ((venda_efetiva / cotacao) - 1) * 100 if cotacao > 0 else 0
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Prêmio do último negócio", fmt_rs(premio_total), f"{retorno_pct:.2f}%".replace(".", ","))
+        c2.metric("Se for exercido, venderá por", fmt_rs(venda_efetiva),
+                  f"{venda_acima_pct:+.2f}% vs. hoje".replace(".", ","))
+        c3.metric("Exposição pelo delta", chance_exibicao,
+                  f"{chance_icone} {chance_texto}", delta_color="off")
+        c4.metric("Negócios no último pregão", f"{negocios}",
+                  f"{liquidez_icone} {liquidez_texto}", delta_color="off",
+                  help="É uma fotografia da negociação recente. Não garante que será possível recomprar a opção futuramente pelo preço desejado.")
+
+        if distancia > 0:
+            chamada = f"{ativo} precisa subir"
+            movimento = f"{distancia:.2f}%"
+            complemento = f"até {data_vencimento}"
+        elif distancia < 0:
+            chamada = "O strike já foi ultrapassado"
+            movimento = f"{abs(distancia):.2f}%"
+            complemento = "A opção já está dentro do dinheiro pela cotação atual."
+        else:
+            chamada = f"{ativo} está no strike"
+            movimento = "0,00%"
+            complemento = f"Vencimento em {data_vencimento}"
+
+        st.markdown(
+            f"""
+            <div style="padding:22px;border-radius:14px;background:#f5f7fb;
+                        margin:14px 0 18px 0;text-align:center;">
+                <div style="font-size:16px;color:#5f6b7a;">📈 Para ocorrer o exercício</div>
+                <div style="font-size:22px;font-weight:600;margin-top:5px;">{chamada}</div>
+                <div style="font-size:44px;font-weight:800;line-height:1.15;">{movimento}</div>
+                <div style="font-size:17px;color:#5f6b7a;">{complemento}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if distancia < 0:
+            parecer = (
+                f"O último negócio desta CALL foi a {fmt_rs(premio_total)} por lote, mas o strike de {fmt_rs(strike)} "
+                f"já está abaixo da cotação atual de {fmt_rs(cotacao)}. Somando o prêmio, a venda "
+                f"efetiva seria de {fmt_rs(venda_efetiva)}, ou {venda_acima_pct:.2f}% em relação ao "
+                f"preço de hoje. A exposição aproximada pelo delta é {chance_frase}."
+            )
+        else:
+            parecer = (
+                f"O último negócio desta CALL foi a {fmt_rs(premio_total)} por lote, equivalente a {retorno_pct:.2f}% "
+                f"sobre a cotação atual. Se houver exercício, suas ações serão vendidas por "
+                f"{fmt_rs(venda_efetiva)} por ação, {venda_acima_pct:.2f}% acima do preço de hoje. "
+                f"Para isso ocorrer, {ativo} precisa subir {distancia:.2f}% até {data_vencimento}. "
+                f"A exposição aproximada pelo delta é {chance_frase}."
+            )
+        reflexao = f"Você ficaria satisfeito em vender suas ações por {fmt_rs(venda_efetiva)} por ação?"
+
+    else:
+        custo_efetivo = float(op.get("preco_efetivo_put", strike - premio_por_acao) or 0)
+        desconto_pct = ((custo_efetivo / cotacao) - 1) * 100 if cotacao > 0 else 0
+        capital_comprometido = strike * 100
+        desembolso_liquido = custo_efetivo * 100
+        retorno_capital_pct = (premio_por_acao / strike * 100) if strike > 0 else 0
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric(
+            "Prêmio do último negócio",
+            fmt_rs(premio_total),
+            f"{retorno_capital_pct:.2f}% do capital".replace(".", ","),
+        )
+        c2.metric("Se for exercido, comprará por", fmt_rs(custo_efetivo),
+                  f"{desconto_pct:+.2f}% vs. hoje".replace(".", ","))
+        c3.metric("Exposição pelo delta", chance_exibicao,
+                  f"{chance_icone} {chance_texto}", delta_color="off")
+        c4.metric(
+            "Negócios no último pregão",
+            f"{negocios}",
+            f"{liquidez_icone} {liquidez_texto}",
+            delta_color="off",
+            help="Ajuda a estimar a facilidade de uma eventual recompra, mas não garante liquidez futura nem execução pelo preço exibido.",
+        )
+
+        f1, f2, f3 = st.columns(3)
+        f1.metric("Capital comprometido (100 ações)", fmt_rs(capital_comprometido))
+        f2.metric("Desembolso líquido se exercido", fmt_rs(desembolso_liquido))
+        f3.metric("Retorno sobre o capital", f"{retorno_capital_pct:.2f}%".replace(".", ","))
+
+        movimento = abs(distancia)
+        direcao = "cair" if distancia < 0 else "subir"
+        st.markdown(
+            f"""
+            <div style="padding:22px;border-radius:14px;background:#f5f7fb;
+                        margin:14px 0 18px 0;text-align:center;">
+                <div style="font-size:16px;color:#5f6b7a;">📉 Para chegar ao strike</div>
+                <div style="font-size:22px;font-weight:600;margin-top:5px;">{ativo} precisa {direcao}</div>
+                <div style="font-size:44px;font-weight:800;line-height:1.15;">{movimento:.2f}%</div>
+                <div style="font-size:17px;color:#5f6b7a;">até {data_vencimento}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if objetivo_put == "Gerar renda":
+            if pd.isna(chance_implicita):
+                ajuste_objetivo = "O delta não foi informado: não é possível classificar o risco pelo delta."
+                nivel_objetivo = "Avaliação de risco incompleta."
+            elif chance_implicita <= 40 and distancia < 0:
+                ajuste_objetivo = (
+                    "A combinação de distância abaixo da cotação e chance implícita baixa favorece "
+                    "a intenção de gerar renda sem buscar o exercício."
+                )
+                nivel_objetivo = "Boa adequação para geração de renda."
+            elif chance_implicita <= 60:
+                ajuste_objetivo = (
+                    "A chance de exercício é moderada. O prêmio pode ser interessante, mas existe "
+                    "uma possibilidade relevante de receber as ações."
+                )
+                nivel_objetivo = "Adequação moderada para geração de renda."
+            else:
+                ajuste_objetivo = (
+                    "A chance implícita de exercício é alta para uma operação cujo objetivo principal "
+                    "é renda. Ela só deve ser considerada se você também aceitar comprar as ações."
+                )
+                nivel_objetivo = "Baixa adequação para geração de renda."
+        else:
+            if pd.isna(chance_implicita):
+                ajuste_objetivo = "O delta não foi informado: não é possível classificar o risco pelo delta."
+                nivel_objetivo = "Avaliação de risco incompleta."
+            elif chance_implicita >= 40:
+                ajuste_objetivo = (
+                    "A chance de exercício é relevante e, por isso, a operação se ajusta à intenção "
+                    "de comprar as ações pelo custo efetivo indicado."
+                )
+                nivel_objetivo = "Boa adequação para compra planejada."
+            elif chance_implicita >= 20:
+                ajuste_objetivo = (
+                    "A compra é possível, mas a chance implícita de exercício ainda é baixa. "
+                    "O prêmio remunera a espera, sem assegurar que as ações serão adquiridas."
+                )
+                nivel_objetivo = "Adequação moderada para compra planejada."
+            else:
+                ajuste_objetivo = (
+                    "A chance implícita de exercício é muito baixa. Embora gere prêmio, esta PUT "
+                    "não se ajusta idealmente à intenção de comprar as ações."
+                )
+                nivel_objetivo = "Baixa adequação para compra planejada."
+
+        parecer = (
+            f"**{nivel_objetivo}** Esta PUT paga {fmt_rs(premio_total)} por lote, equivalente a "
+            f"{retorno_capital_pct:.2f}% sobre o capital comprometido. Se houver exercício, o custo "
+            f"efetivo será {fmt_rs(custo_efetivo)} por ação ({desconto_pct:+.2f}% em relação ao preço "
+            f"de hoje). A exposição aproximada pelo delta é {chance_frase}. "
+            f"{ajuste_objetivo}"
+        )
+        reflexao = f"Você ficaria satisfeito em comprar {ativo} por {fmt_rs(custo_efetivo)} por ação?"
+
+    if op.get("status_dados", "") != "✓ Dados completos":
+        st.warning(f"Qualidade dos dados: {op.get('status_dados', 'N/D')}. "
+                   f"Último negócio: {op.get('data_ultimo_negocio', 'N/D')}; "
+                   f"referência da coleta: {op.get('data_referencia_pregao', 'N/D')}. "
+                   "Prêmio do último negócio não é oferta executável; confira bid/ask na corretora.")
+    st.markdown("#### Parecer")
+    st.info(parecer)
+
+    st.markdown("#### Antes de decidir")
+    st.warning(reflexao)
+
+    if tipo == "PUT":
+        st.warning(
+            f"⚠️ Confirme que há caixa disponível para um eventual exercício. "
+            f"Para 100 ações, reserve {fmt_rs(strike * 100)}. "
+            "A quantidade de negócios observada ajuda a avaliar uma possível saída antecipada, "
+            "mas não garante liquidez futura nem execução pelo preço exibido."
+        )
+
+    with st.expander("Ver detalhes técnicos"):
+        t1, t2, t3, t4, t5 = st.columns(5)
+        t1.metric("Ativo", ativo)
+        t2.metric("Código", codigo)
+        t3.metric("Cotação atual", fmt_rs(cotacao))
+        t4.metric("Strike", fmt_rs(strike))
+        t5.metric("Delta", f"{delta:.3f}".replace(".", ",") if pd.notna(delta) and abs(delta) > 1e-6 else "N/D")
+
+        t6, t7, t8, t9 = st.columns(4)
+        t6.metric("Situação técnica", str(op.get("situacao", "")))
+        t7.metric("Distância do strike", f"{distancia:.2f}%".replace(".", ","))
+        t8.metric("Negócios", negocios)
+        t9.metric("Volatilidade implícita", f"{float(op.get('volatilidade', 0) or 0):.2f}%".replace(".", ","))
+
+def render_velocimetro(percentual):
+    """Velocímetro semicircular em HTML/CSS, sem dependências extras."""
+    pct = max(0.0, min(float(percentual), 100.0))
+    angulo = pct * 1.8
+    if pct >= 80:
+        cor = "#21c55d"
+        faixa = "Prêmio quase todo capturado"
+    elif pct >= 40:
+        cor = "#f2c94c"
+        faixa = "Operação em andamento"
+    else:
+        cor = "#ef5350"
+        faixa = "Ainda há bastante prêmio em aberto"
+
+    st.markdown(
+        f"""
+        <div style="display:flex;flex-direction:column;align-items:center;margin:4px 0 12px 0;">
+          <div style="position:relative;width:230px;height:115px;overflow:hidden;">
+            <div style="position:absolute;width:230px;height:230px;border-radius:50%;
+                        background:conic-gradient(from 270deg, {cor} 0deg {angulo}deg, #e9edf3 {angulo}deg 180deg, transparent 180deg 360deg);">
+            </div>
+            <div style="position:absolute;left:25px;top:25px;width:180px;height:180px;border-radius:50%;background:white;"></div>
+            <div style="position:absolute;left:112px;bottom:0;width:6px;height:88px;background:#343a40;
+                        transform-origin:bottom center;transform:rotate({-90 + angulo}deg);border-radius:4px;"></div>
+            <div style="position:absolute;left:103px;bottom:-9px;width:24px;height:24px;border-radius:50%;background:#343a40;"></div>
+          </div>
+          <div style="font-size:30px;font-weight:700;margin-top:-2px;">{pct:.1f}%</div>
+          <div style="font-size:14px;color:#667085;">{faixa}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def carregar_operacoes():
+    if not ARQUIVO_OPERACOES.exists():
+        return pd.DataFrame(columns=COLUNAS_OPERACOES)
+    try:
+        df = pd.read_csv(ARQUIVO_OPERACOES, dtype={"codigo": str, "ativo_base": str})
+        for col in COLUNAS_OPERACOES:
+            if col not in df.columns:
+                df[col] = "" if col in ["id", "data_abertura", "ativo_base", "codigo", "tipo", "vencimento", "status", "observacao"] else 0.0
+        return df[COLUNAS_OPERACOES]
+    except Exception:
+        return pd.DataFrame(columns=COLUNAS_OPERACOES)
+
+
+def salvar_operacoes(df):
+    df.to_csv(ARQUIVO_OPERACOES, index=False)
+
+
+def vencimento_opcoesnet(data_vencimento):
+    """Converte a data cadastrada no rótulo usado pelo seletor do Opções.Net."""
+    try:
+        data_op = datetime.strptime(str(data_vencimento)[:10], "%Y-%m-%d").date()
+        texto = data_op.strftime("%d/%m")
+    except (TypeError, ValueError):
+        return None
+
+    for rotulo, valor in VENCIMENTOS_OPCOESNET.items():
+        if valor == texto:
+            return rotulo
+    return None
+
+
+def cotacao_mercado_codigo(codigo):
+    dados = st.session_state.get("dados")
+    if dados is None or dados.empty:
+        return None
+    codigo_procurado = normalizar_codigo(codigo)
+    codigos_mercado = dados["codigo"].apply(normalizar_codigo)
+    achado = dados[codigos_mercado == codigo_procurado]
+    if achado.empty:
+        return None
+    return float(achado.iloc[0]["ultimo"])
+
+
+def cotacao_mercado_operacao(row):
+    """Localiza a opção por código e usa ativo/tipo/strike como contingência."""
+    automatico = cotacao_mercado_codigo(row["codigo"])
+    if automatico is not None and automatico > 0:
+        return automatico
+
+    dados = st.session_state.get("dados")
+    if dados is None or dados.empty:
+        return None
+
+    ativo_procurado = normalizar_codigo(row["ativo_base"])
+    tipo_procurado = str(row["tipo"]).upper().strip()
+    strike_procurado = float(row["strike"])
+
+    candidatos = dados.copy()
+    candidatos = candidatos[
+        (candidatos["ativo"].apply(normalizar_codigo) == ativo_procurado)
+        & (candidatos["tipo"].astype(str).str.upper().str.strip() == tipo_procurado)
+        & ((pd.to_numeric(candidatos["strike"], errors="coerce") - strike_procurado).abs() < 0.005)
+    ]
+
+    # Evita escolher silenciosamente se houver mais de uma opção no mesmo strike.
+    if len(candidatos) != 1:
+        return None
+
+    cotacao = float(candidatos.iloc[0]["ultimo"])
+    return cotacao if cotacao > 0 else None
+
+
+def enriquecer_operacoes(df):
+    if df.empty:
+        return df.copy()
+
+    resultado = df.copy()
+    numericas = ["strike", "premio_recebido", "quantidade", "cotacao_atual_manual"]
+    for col in numericas:
+        resultado[col] = pd.to_numeric(resultado[col], errors="coerce").fillna(0)
+
+    def preco_atual(row):
+        automatico = cotacao_mercado_operacao(row)
+        return automatico if automatico is not None else float(row["cotacao_atual_manual"])
+
+    resultado["cotacao_atual"] = resultado.apply(preco_atual, axis=1)
+    resultado["cotacao_disponivel"] = resultado["cotacao_atual"] > 0
+    resultado["valor_recebido"] = resultado["premio_recebido"] * resultado["quantidade"]
+    resultado["custo_encerramento"] = resultado.apply(
+        lambda r: r["cotacao_atual"] * r["quantidade"]
+        if r["cotacao_disponivel"] else pd.NA,
+        axis=1,
+    )
+    resultado["resultado_atual"] = resultado.apply(
+        lambda r: r["valor_recebido"] - r["custo_encerramento"]
+        if r["cotacao_disponivel"] else pd.NA,
+        axis=1,
+    )
+    resultado["capital_referencia"] = resultado["strike"] * resultado["quantidade"]
+    resultado["rentabilidade_atual_pct"] = resultado.apply(
+        lambda r: (r["resultado_atual"] / r["capital_referencia"] * 100)
+        if r["cotacao_disponivel"] and r["capital_referencia"] > 0 else pd.NA,
+        axis=1
+    )
+    resultado["rentabilidade_maxima_pct"] = resultado.apply(
+        lambda r: (r["valor_recebido"] / r["capital_referencia"] * 100)
+        if r["capital_referencia"] > 0 else 0,
+        axis=1
+    )
+    resultado["premio_capturado_pct"] = resultado.apply(
+        lambda r: (r["resultado_atual"] / r["valor_recebido"] * 100)
+        if r["cotacao_disponivel"] and r["valor_recebido"] > 0 else pd.NA,
+        axis=1
+    )
+
+    hoje = date.today()
+    def dias_restantes(valor):
+        try:
+            return (datetime.strptime(str(valor)[:10], "%Y-%m-%d").date() - hoje).days
+        except ValueError:
+            return 0
+
+    resultado["dias_restantes"] = resultado["vencimento"].apply(dias_restantes)
+
+    def diagnostico_saida(row):
+        if not row["cotacao_disponivel"]:
+            return "⚪ Cotação não encontrada — informe ou atualize"
+        pct = float(row["premio_capturado_pct"])
+        dias = row["dias_restantes"]
+        if pct >= 90:
+            return "🟢 Avaliar encerramento: ≥ 90% capturado"
+        if pct >= 80:
+            return "🟢 Pode valer encerrar: ≥ 80% capturado"
+        if pct >= 60 and dias <= 7:
+            return "🟡 Avaliar risco x prêmio restante"
+        if pct < 0:
+            return "🔴 Posição em prejuízo: revisar risco"
+        return "🟡 Manter e acompanhar"
+
+    resultado["sinal"] = resultado.apply(diagnostico_saida, axis=1)
+    return resultado
+
+
+# ----------------------------- INTERFACE -----------------------------
+cabecalho_titulo, cabecalho_versao = st.columns([5, 1])
+with cabecalho_titulo:
+    st.title("📈 MÉTODO PUT + CALL")
+with cabecalho_versao:
+    st.markdown(
+        f"""
+        <div style="
+            margin-top:1.15rem;
+            padding:6px 10px;
+            border:1px solid #d0d5dd;
+            border-radius:999px;
+            background:#f8fafc;
+            color:#475467;
+            font-size:12px;
+            font-weight:700;
+            text-align:center;
+            white-space:nowrap;">
+            Versão {VERSAO_APP}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+st.caption("Oportunidades de mercado + acompanhamento das operações abertas")
+
+if "empresas" not in st.session_state:
+    st.session_state.empresas = ["TIMS3", "BBSE3", "ITSA4", "PETR4"]
+if "operacoes" not in st.session_state:
+    st.session_state.operacoes = carregar_operacoes()
+
+aba_oportunidades, aba_operacoes = st.tabs(["🔎 Oportunidades", "📒 Operações abertas"])
+
+with aba_oportunidades:
+    topo1, topo2 = st.columns([1, 1])
+    with topo1:
+        st.subheader("Resumo do dia")
+        st.write(f"Empresas monitoradas: **{len(st.session_state.empresas)}**")
+        nova = st.text_input("Adicionar empresa", placeholder="Ex.: CPFL3").upper().strip()
+        if nova and len(nova) < 5:
+            st.warning("Digite o ticker completo. Exemplo: BBAS3, não BBAS.")
+        if st.button("Adicionar empresa"):
+            if not nova:
+                st.warning("Digite uma empresa.")
+            elif len(nova) < 5:
+                st.error("Ticker incompleto.")
+            elif nova in st.session_state.empresas:
+                st.warning("Essa empresa já está na lista.")
+            elif len(st.session_state.empresas) >= 10:
+                st.error("Limite de 10 empresas.")
+            else:
+                st.session_state.empresas.append(nova)
+                st.rerun()
+
+    with topo2:
+        st.subheader("Empresas / ações")
+        for emp in list(st.session_state.empresas):
+            col1, col2 = st.columns([4, 1])
+            col1.write(f"**{emp}**")
+            if col2.button("remover", key=f"rem_{emp}"):
+                st.session_state.empresas.remove(emp)
+                st.rerun()
+
+    st.divider()
+    st.subheader("Vencimento para buscar")
+    meses_busca = proximos_meses()
+    rotulos_meses = [item[0] for item in meses_busca]
+    mes_busca_rotulo = st.selectbox(
+        "Mês do vencimento:",
+        rotulos_meses,
+        key="mes_vencimento_busca",
+    )
+    mes_busca_item = next(item for item in meses_busca if item[0] == mes_busca_rotulo)
+    mes_busca_num, ano_busca = mes_busca_item[1], mes_busca_item[2]
+    incluir_semanais = st.checkbox(
+        "Incluir vencimentos semanais deste mês",
+        value=False,
+        help=(
+            "O app verifica no Opções.Net quais vencimentos semanais realmente "
+            "existem para cada ativo. Se não houver, mantém apenas o mensal."
+        ),
+    )
+    st.caption(
+        "Com o checkbox desmarcado, o app busca somente o vencimento mensal. "
+        "Marcado, reúne o mensal e as semanais ainda disponíveis no mês."
+    )
+
+    if st.button("🔄 Atualizar mercado", type="primary"):
+        dfs = []
+        progress = st.progress(0)
+        status = st.empty()
+
+        for i, emp in enumerate(st.session_state.empresas):
+            modo_busca = "mensal + semanais" if incluir_semanais else "mensal"
+            status.write(f"Coletando {emp} — {mes_busca_rotulo} ({modo_busca})...")
+            try:
+                df_emp = coletar_opcoes(
+                    emp,
+                    mes_num=mes_busca_num,
+                    ano=ano_busca,
+                    incluir_semanais=incluir_semanais,
+                )
+                if not df_emp.empty:
+                    dfs.append(df_emp)
+                else:
+                    st.warning(
+                        f"Nenhuma opção encontrada para {emp} em {mes_busca_rotulo}."
+                    )
+            except Exception as e:
+                st.warning(f"Erro em {emp}: {e}")
+            progress.progress((i + 1) / max(len(st.session_state.empresas), 1))
+
+        status.empty()
+        if dfs:
+            dados = preparar(pd.concat(dfs, ignore_index=True))
+            meses_coletados = sorted(dados["mes"].dropna().unique().tolist())
+            mes_nome = NOMES_MESES[mes_busca_num]
+            if mes_nome not in meses_coletados:
+                st.error(
+                    f"Não consegui acessar {mes_busca_rotulo}. "
+                    f"A coleta retornou: {', '.join(meses_coletados) or 'nenhum mês'}"
+                )
+            dados = dados[dados["mes"] == mes_nome]
+
+            st.session_state.dados = dados
+            st.session_state.cotacoes_manuais = {}
+            st.session_state.vencimento_carregado = mes_busca_rotulo
+            st.session_state.incluiu_semanais = incluir_semanais
+            semanais_encontradas = dados[
+                dados["tipo_vencimento"] == "Semanal"
+            ]["vencimento_opcao"].nunique()
+            if incluir_semanais:
+                st.success(
+                    f"Mercado atualizado para {mes_busca_rotulo}. "
+                    f"Vencimentos semanais encontrados: {semanais_encontradas}."
+                )
+            else:
+                st.success(f"Mercado mensal atualizado para {mes_busca_rotulo}.")
+        else:
+            st.error("Nenhuma opção foi coletada.")
+
+    if "dados" not in st.session_state:
+        st.warning("Escolha o vencimento e clique em **Atualizar mercado**.")
+    else:
+        df_base = st.session_state.dados.copy()
+        st.divider()
+        st.write(f"Mês carregado: **{st.session_state.get('vencimento_carregado', 'Indefinido')}**")
+        st.write(f"Opções analisadas: **{len(df_base)}**")
+
+        if df_base.empty:
+            st.warning("Nenhuma opção encontrada para esse vencimento.")
+        else:
+            if "cotacao_site" not in df_base.columns:
+                df_base["cotacao_site"] = df_base["cotacao_atual"]
+            if "cotacoes_manuais" not in st.session_state:
+                st.session_state.cotacoes_manuais = {}
+
+            ativos_cotacao = sorted(
+                df_base["ativo"].dropna().astype(str).str.upper().unique().tolist()
+            )
+            with st.expander("✏️ Atualizar cotação das ações — opcional"):
+                st.caption(
+                    "Use a cotação atual da corretora para recalcular distância do "
+                    "strike, retorno e parecer. O prêmio e o Delta permanecem os do "
+                    "fechamento coletado na Opções.Net."
+                )
+                valores_digitados = {}
+                with st.form("form_cotacoes_manuais"):
+                    colunas_cotacao = st.columns(min(len(ativos_cotacao), 4))
+                    for indice, ativo in enumerate(ativos_cotacao):
+                        linhas_ativo = df_base[df_base["ativo"] == ativo]
+                        cotacao_site = float(linhas_ativo["cotacao_site"].median())
+                        cotacao_inicial = float(
+                            st.session_state.cotacoes_manuais.get(ativo, cotacao_site)
+                        )
+                        with colunas_cotacao[indice % len(colunas_cotacao)]:
+                            st.caption(f"{ativo} · site: {fmt_rs(cotacao_site)}")
+                            valores_digitados[ativo] = st.number_input(
+                                f"Cotação atual de {ativo}",
+                                min_value=0.01,
+                                value=cotacao_inicial,
+                                step=0.01,
+                                format="%.2f",
+                            )
+                    aplicar_cotacoes = st.form_submit_button(
+                        "Aplicar cotações informadas",
+                        type="primary",
+                    )
+
+                if aplicar_cotacoes:
+                    st.session_state.cotacoes_manuais = valores_digitados
+                    st.rerun()
+
+                if st.session_state.cotacoes_manuais:
+                    if st.button("Voltar às cotações da Opções.Net"):
+                        st.session_state.cotacoes_manuais = {}
+                        st.rerun()
+
+            df = aplicar_cotacoes_manuais(
+                df_base,
+                st.session_state.get("cotacoes_manuais", {}),
+            )
+            cotacoes_aplicadas = st.session_state.get("cotacoes_manuais", {})
+            if cotacoes_aplicadas:
+                resumo_cotacoes = " · ".join(
+                    f"{ativo}: {fmt_rs(valor)}"
+                    for ativo, valor in sorted(cotacoes_aplicadas.items())
+                )
+                st.info(
+                    f"Cotações manuais aplicadas — {resumo_cotacoes}. "
+                    "Prêmios e Deltas permanecem os do fechamento anterior."
+                )
+
+            empresas_disponiveis = sorted(df["ativo"].dropna().astype(str).unique().tolist())
+            empresa_visualizada = st.selectbox(
+                "Empresa para visualizar:",
+                ["Todas"] + empresas_disponiveis,
+                key="empresa_visualizada_oportunidades",
+                help="A troca de empresa apenas filtra os dados já coletados; não faz uma nova busca.",
+            )
+
+            if empresa_visualizada == "Todas":
+                df_visual = df.copy()
+                st.caption(
+                    f"Exibindo todas as empresas coletadas: "
+                    f"{len(df_visual[df_visual['tipo'] == 'CALL'])} CALLs e "
+                    f"{len(df_visual[df_visual['tipo'] == 'PUT'])} PUTs."
+                )
+            else:
+                df_visual = df[df["ativo"] == empresa_visualizada].copy()
+                st.caption(
+                    f"{empresa_visualizada}: "
+                    f"{len(df_visual[df_visual['tipo'] == 'CALL'])} CALLs e "
+                    f"{len(df_visual[df_visual['tipo'] == 'PUT'])} PUTs encontradas."
+                )
+
+            st.markdown("### Comparar oportunidades")
+            if st.session_state.get("incluiu_semanais", False):
+                st.caption(
+                    "O equivalente mensal normaliza o retorno para 21 dias úteis "
+                    "apenas para comparação; não é promessa de retorno nem pressupõe "
+                    "que a operação poderá ser repetida."
+                )
+            criterios_ordenacao = [
+                "Maior retorno",
+                "Maior retorno equivalente mensal",
+                "Menor exposição pelo delta",
+                "Maior venda efetiva / menor custo efetivo",
+                "Maior distância até o strike",
+                "Maior liquidez",
+            ]
+            criterio_ordem = st.selectbox(
+                "Ordenar opções por:",
+                criterios_ordenacao,
+                index=1 if st.session_state.get("incluiu_semanais", False) else 0,
+                key="criterio_ordenacao_oportunidades",
+            )
+
+            calls_todas = df_visual[df_visual["tipo"] == "CALL"].copy()
+            puts_todas = df_visual[df_visual["tipo"] == "PUT"].copy()
+
+            if criterio_ordem == "Maior retorno":
+                calls_todas = ordenar_oportunidades(calls_todas, "retorno_pct")
+                puts_todas = ordenar_oportunidades(puts_todas, "retorno_pct")
+            elif criterio_ordem == "Maior retorno equivalente mensal":
+                calls_todas = ordenar_oportunidades(calls_todas, "retorno_equiv_mensal_pct")
+                puts_todas = ordenar_oportunidades(puts_todas, "retorno_equiv_mensal_pct")
+            elif criterio_ordem == "Menor exposição pelo delta":
+                calls_todas = ordenar_oportunidades(calls_todas, "chance_exercicio_pct", crescente=True)
+                puts_todas = ordenar_oportunidades(puts_todas, "chance_exercicio_pct", crescente=True)
+            elif criterio_ordem == "Maior venda efetiva / menor custo efetivo":
+                calls_todas = ordenar_oportunidades(calls_todas, "venda_efetiva_call")
+                puts_todas = ordenar_oportunidades(puts_todas, "preco_efetivo_put", crescente=True)
+            elif criterio_ordem == "Maior distância até o strike":
+                calls_todas = ordenar_oportunidades(calls_todas, "distancia_pct")
+                puts_todas = puts_todas.assign(
+                    distancia_ordenacao=puts_todas["distancia_pct"].abs()
+                )
+                puts_todas = ordenar_oportunidades(puts_todas, "distancia_ordenacao")
+            else:
+                calls_todas = ordenar_oportunidades(calls_todas, "negocios")
+                puts_todas = ordenar_oportunidades(puts_todas, "negocios")
+
+            st.caption("Ranking: contratos com delta disponível e negociação na data de referência aparecem primeiro. "
+                       "Os demais permanecem visíveis, sinalizados para conferência. "
+                       "Delta é proxy de risco, não probabilidade exata de exercício.")
+            calls = calls_todas.copy()
+            puts = puts_todas.copy()
+
+            for tabela_op in (calls, puts):
+                tabela_op["Retorno"] = tabela_op["retorno_pct"].map(lambda x: f"{x:.2f}%".replace(".", ","))
+                tabela_op["Equiv. mensal"] = tabela_op["retorno_equiv_mensal_pct"].map(
+                    lambda x: f"{x:.2f}%".replace(".", ",")
+                )
+                tabela_op["Vencimento"] = tabela_op["vencimento_opcao"].astype(str)
+                tabela_op["Prazo"] = tabela_op["dias_uteis"].map(
+                    lambda x: f"{int(x)} d.u." if x else "—"
+                )
+                tabela_op["Série"] = tabela_op["tipo_vencimento"]
+                tabela_op["Exposição delta"] = tabela_op["delta"].map(
+                    lambda x: "N/D" if pd.isna(x) or abs(x) < 1e-6
+                    else f"{abs(x)*100:.0f}% · {classificar_chance_exercicio(x)[1]}"
+                )
+                tabela_op["Qualidade"] = tabela_op["status_dados"]
+
+            calls["Venda efetiva"] = calls["venda_efetiva_call"].map(fmt_rs)
+            calls["Precisa subir"] = calls["distancia_pct"].map(descricao_exercicio_call)
+            puts["Custo efetivo"] = puts["preco_efetivo_put"].map(fmt_rs)
+            puts["Distância do strike"] = puts["distancia_pct"].map(
+                lambda x: f"{abs(x):.2f}%".replace(".", ",")
+            )
+
+            col_call, col_put = st.columns(2)
+
+            with col_call:
+                st.subheader(f"💜 CALLs · {len(calls)} opções")
+                if calls.empty:
+                    st.warning("Nenhuma CALL encontrada.")
+                    cod_call = None
+                else:
+                    st.dataframe(
+                        calls[[
+                            "ativo", "codigo", "Série", "Vencimento", "Prazo",
+                            "Retorno", "Equiv. mensal", "Venda efetiva",
+                            "Precisa subir", "Exposição delta", "Qualidade"
+                        ]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    opcoes_call = calls.sort_values(
+                        ["ativo", "strike"]
+                    )["codigo"].drop_duplicates().tolist()
+                    cod_call = st.selectbox("Selecionar CALL para o Parecer", opcoes_call, key="sel_call")
+
+            with col_put:
+                objetivo_put = "Gerar renda"
+                if puts.empty:
+                    st.subheader("🟢 PUTs · 0 opções")
+                    st.warning("Nenhuma PUT encontrada.")
+                    cod_put = None
+                else:
+                    opcoes_put = puts.sort_values(
+                        ["ativo", "strike"]
+                    )["codigo"].drop_duplicates().tolist()
+                    codigo_put_atual = st.session_state.get("sel_put", opcoes_put[0])
+                    if codigo_put_atual not in opcoes_put:
+                        codigo_put_atual = opcoes_put[0]
+                    put_referencia = puts_todas[puts_todas["codigo"] == codigo_put_atual].iloc[0]
+
+                    st.markdown(
+                        f"""
+                        <div style="display:flex;align-items:center;justify-content:space-between;
+                                    gap:12px;margin:0 0 12px 0;flex-wrap:nowrap;">
+                            <div style="font-size:1.75rem;font-weight:700;white-space:nowrap;">
+                                🟢 PUTs · {len(puts)} opções
+                            </div>
+                            <div style="font-size:1.15rem;font-weight:700;color:#344054;
+                                        text-align:right;white-space:nowrap;">
+                                {str(put_referencia['ativo']).upper()} · {fmt_rs(put_referencia['cotacao_atual'])}
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                    st.dataframe(
+                        puts[[
+                            "ativo", "codigo", "Série", "Vencimento", "Prazo",
+                            "Retorno", "Equiv. mensal", "Custo efetivo",
+                            "Distância do strike", "Exposição delta", "Qualidade"
+                        ]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    cod_put = st.selectbox("Selecionar PUT para o Parecer", opcoes_put, key="sel_put")
+
+                    objetivo_put = st.radio(
+                        "Intenção da PUT",
+                        ["Gerar renda", "Comprar a ação"],
+                        horizontal=True,
+                        key="objetivo_put_oportunidades",
+                        help="A escolha altera somente a interpretação do parecer.",
+                    )
+
+            st.divider()
+            diag_call, diag_put = st.columns(2)
+            with diag_call:
+                if cod_call:
+                    card_diagnostico(df_visual[df_visual["codigo"] == cod_call].iloc[0], "CALL")
+            with diag_put:
+                if cod_put:
+                    card_diagnostico(
+                        df_visual[df_visual["codigo"] == cod_put].iloc[0],
+                        "PUT",
+                        objetivo_put=objetivo_put,
+                    )
+
+with aba_operacoes:
+    st.subheader("📒 Cadastro e acompanhamento")
+    st.caption(
+        "O resultado é estimado para uma opção vendida: prêmio recebido menos o custo atual de recompra. "
+        "Não inclui corretagem, emolumentos, imposto nem eventual diferença entre último negócio e preço executável."
+    )
+
+    with st.expander("➕ Cadastrar nova operação", expanded=st.session_state.operacoes.empty):
+        with st.form("form_nova_operacao", clear_on_submit=True):
+            a1, a2, a3, a4 = st.columns(4)
+            ativo_base = a1.text_input("Ativo-base", value="TIMS3").upper().strip()
+            codigo = a2.text_input("Código da opção", placeholder="Ex.: TIMSG235").upper().strip()
+            tipo = a3.selectbox("Tipo", ["CALL", "PUT"])
+            strike = a4.number_input("Strike", min_value=0.0, step=0.01, format="%.2f")
+
+            b1, b2, b3, b4 = st.columns(4)
+            premio = b1.number_input("Prêmio recebido por ação", min_value=0.0, step=0.01, format="%.2f")
+            quantidade = b2.number_input("Quantidade de ações", min_value=100, step=100, value=100)
+            vencimento = b3.date_input("Vencimento")
+            cotacao_manual = b4.number_input(
+                "Cotação atual da opção (opcional)", min_value=0.0, step=0.01, format="%.2f",
+                help="Usada quando o código não está no último mercado carregado."
+            )
+
+            observacao = st.text_input("Observação", placeholder="Ex.: CALL coberta das 100 TIMS3")
+            salvar = st.form_submit_button("Salvar operação", type="primary")
+
+            if salvar:
+                if not ativo_base or not codigo:
+                    st.error("Preencha o ativo-base e o código da opção.")
+                else:
+                    nova_linha = {
+                        "id": uuid4().hex[:10],
+                        "data_abertura": date.today().isoformat(),
+                        "ativo_base": ativo_base,
+                        "codigo": codigo,
+                        "tipo": tipo,
+                        "strike": strike,
+                        "premio_recebido": premio,
+                        "quantidade": int(quantidade),
+                        "vencimento": vencimento.isoformat(),
+                        "cotacao_atual_manual": cotacao_manual,
+                        "status": "ABERTA",
+                        "observacao": observacao,
+                    }
+                    st.session_state.operacoes = pd.concat(
+                        [st.session_state.operacoes, pd.DataFrame([nova_linha])], ignore_index=True
+                    )
+                    salvar_operacoes(st.session_state.operacoes)
+                    st.success("Operação cadastrada.")
+                    st.rerun()
+
+    abertas = st.session_state.operacoes[st.session_state.operacoes["status"] == "ABERTA"].copy()
+
+    if abertas.empty:
+        st.info("Nenhuma operação aberta cadastrada.")
+    else:
+        if st.button("🔄 Atualizar cotações das operações", type="primary"):
+            grupos = abertas[["ativo_base", "vencimento"]].drop_duplicates().to_dict("records")
+            partes_operacoes = []
+            progresso_ops = st.progress(0)
+            status_ops = st.empty()
+
+            for indice, grupo in enumerate(grupos):
+                ativo_grupo = normalizar_codigo(grupo["ativo_base"])
+                status_ops.write(f"Buscando {ativo_grupo} — {grupo['vencimento']}...")
+
+                try:
+                    data_operacao = datetime.strptime(
+                        str(grupo["vencimento"])[:10], "%Y-%m-%d"
+                    ).date()
+                    data_exata = data_operacao.strftime("%d/%m")
+                except ValueError:
+                    data_operacao = None
+
+                if data_operacao is None:
+                    st.warning(
+                        f"O vencimento {grupo['vencimento']} de {ativo_grupo} é inválido."
+                    )
+                else:
+                    try:
+                        parte = coletar_opcoes(
+                            ativo_grupo,
+                            mes_num=data_operacao.month,
+                            ano=data_operacao.year,
+                            data_exata=data_exata,
+                        )
+                        if not parte.empty:
+                            parte = preparar(parte)
+                            mes_nome = NOMES_MESES[data_operacao.month]
+                            parte = parte[parte["mes"] == mes_nome]
+                            partes_operacoes.append(parte)
+                        else:
+                            st.warning(f"Nenhuma opção encontrada para {ativo_grupo}.")
+                    except Exception as erro:
+                        st.warning(f"Erro ao buscar {ativo_grupo}: {erro}")
+
+                progresso_ops.progress((indice + 1) / max(len(grupos), 1))
+
+            status_ops.empty()
+            if partes_operacoes:
+                novos_dados = pd.concat(partes_operacoes, ignore_index=True)
+                dados_anteriores = st.session_state.get("dados")
+                if dados_anteriores is not None and not dados_anteriores.empty:
+                    novos_dados = pd.concat([dados_anteriores, novos_dados], ignore_index=True)
+                st.session_state.dados = novos_dados.drop_duplicates(
+                    subset=["ativo", "codigo", "tipo"], keep="last"
+                )
+                st.success("Cotações das operações atualizadas.")
+                st.rerun()
+            else:
+                st.error("Não foi possível atualizar as cotações das operações.")
+
+        operacoes_calc = enriquecer_operacoes(abertas)
+
+        total_recebido = operacoes_calc["valor_recebido"].sum()
+        operacoes_cotadas = operacoes_calc[operacoes_calc["cotacao_disponivel"]].copy()
+        operacoes_sem_cotacao = len(operacoes_calc) - len(operacoes_cotadas)
+        resultado_total = operacoes_cotadas["resultado_atual"].sum()
+        premio_cotado = operacoes_cotadas["valor_recebido"].sum()
+        premio_pct_total = (resultado_total / premio_cotado * 100) if premio_cotado > 0 else 0
+
+        capital_total = operacoes_cotadas["capital_referencia"].sum()
+        rentabilidade_total = (resultado_total / capital_total * 100) if capital_total > 0 else 0
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Operações abertas", len(operacoes_calc))
+        m2.metric("Prêmios recebidos", fmt_rs(total_recebido))
+        m3.metric("Resultado atual estimado", fmt_rs(resultado_total))
+        m4.metric("Prêmio capturado", fmt_pct(premio_pct_total))
+        m5.metric("Rentabilidade atual", fmt_pct(rentabilidade_total),
+                  help="Resultado atual dividido pelo capital de referência (strike × quantidade).")
+
+        if operacoes_sem_cotacao:
+            st.warning(
+                f"{operacoes_sem_cotacao} operação(ões) está(ão) sem cotação válida e não foi(ram) "
+                "incluída(s) no resultado, no prêmio capturado e na rentabilidade atual."
+            )
+
+        st.divider()
+        for _, op in operacoes_calc.iterrows():
+            with st.container(border=True):
+                titulo = f"{op['tipo']} · {op['codigo']} · {op['ativo_base']}"
+                st.markdown(f"### {titulo}")
+
+                c1, c2, c3, c4, c5, c6 = st.columns(6)
+                c1.metric("Strike", fmt_rs(op["strike"]))
+                c2.metric("Prêmio recebido", fmt_rs(op["premio_recebido"]))
+                c3.metric(
+                    "Cotação atual",
+                    fmt_rs(op["cotacao_atual"]) if op["cotacao_disponivel"] else "Não encontrada",
+                )
+                c4.metric(
+                    "Resultado",
+                    fmt_rs(op["resultado_atual"]) if op["cotacao_disponivel"] else "Não disponível",
+                )
+                c5.metric(
+                    "Prêmio capturado",
+                    fmt_pct(op["premio_capturado_pct"]) if op["cotacao_disponivel"] else "Não disponível",
+                )
+                c6.metric("Dias restantes", int(op["dias_restantes"]))
+
+                r1, r2, r3 = st.columns(3)
+                r1.metric(
+                    "Rentabilidade atual",
+                    fmt_pct(op["rentabilidade_atual_pct"]) if op["cotacao_disponivel"] else "Não disponível",
+                    help="Resultado atual ÷ (strike × quantidade)."
+                )
+                r2.metric(
+                    "Rentabilidade máxima",
+                    fmt_pct(op["rentabilidade_maxima_pct"]),
+                    help="Prêmio total recebido ÷ (strike × quantidade)."
+                )
+                r3.metric("Capital de referência", fmt_rs(op["capital_referencia"]))
+
+                gauge_col, diag_col = st.columns([1, 2])
+                with gauge_col:
+                    if op["cotacao_disponivel"]:
+                        render_velocimetro(op["premio_capturado_pct"])
+                    else:
+                        st.info("O velocímetro será exibido quando houver uma cotação válida.")
+                with diag_col:
+                    lucro_maximo = op["valor_recebido"]
+                    d1, d2 = st.columns(2)
+                    d1.metric("Lucro máximo possível", fmt_rs(lucro_maximo))
+                    if op["cotacao_disponivel"]:
+                        premio_restante = max(lucro_maximo - op["resultado_atual"], 0)
+                        d2.metric("Prêmio ainda em aberto", fmt_rs(premio_restante))
+                    else:
+                        d2.metric("Prêmio ainda em aberto", "Não disponível")
+                    st.write(f"**Diagnóstico:** {op['sinal']}")
+
+                if pd.notna(op["observacao"]) and str(op["observacao"]).strip() not in ("", "nan"):
+                    st.caption(str(op["observacao"]))
+
+                e1, e2, e3 = st.columns([2, 2, 1])
+                nova_cotacao = e1.number_input(
+                    "Atualizar cotação manual", min_value=0.0, step=0.01,
+                    value=float(op["cotacao_atual_manual"]), format="%.2f",
+                    key=f"cot_{op['id']}"
+                )
+                if e2.button("💾 Salvar cotação", key=f"salvar_cot_{op['id']}"):
+                    idx = st.session_state.operacoes.index[st.session_state.operacoes["id"] == op["id"]]
+                    if len(idx):
+                        st.session_state.operacoes.loc[idx[0], "cotacao_atual_manual"] = nova_cotacao
+                        salvar_operacoes(st.session_state.operacoes)
+                        st.rerun()
+
+                if e3.button("✅ Encerrar", key=f"encerrar_{op['id']}"):
+                    idx = st.session_state.operacoes.index[st.session_state.operacoes["id"] == op["id"]]
+                    if len(idx):
+                        st.session_state.operacoes.loc[idx[0], "status"] = "ENCERRADA"
+                        salvar_operacoes(st.session_state.operacoes)
+                        st.rerun()
+
+                with st.expander("✏️ Editar ou excluir esta operação"):
+                    with st.form(f"editar_{op['id']}"):
+                        x1, x2, x3, x4 = st.columns(4)
+                        edit_ativo = x1.text_input("Ativo-base", value=str(op["ativo_base"]), key=f"ea_{op['id']}").upper().strip()
+                        edit_codigo = x2.text_input("Código da opção", value=str(op["codigo"]), key=f"ec_{op['id']}").upper().strip()
+                        edit_tipo = x3.selectbox(
+                            "Tipo", ["CALL", "PUT"],
+                            index=0 if str(op["tipo"]).upper() == "CALL" else 1,
+                            key=f"et_{op['id']}"
+                        )
+                        edit_strike = x4.number_input(
+                            "Strike", min_value=0.0, step=0.01, value=float(op["strike"]),
+                            format="%.2f", key=f"es_{op['id']}"
+                        )
+
+                        y1, y2, y3, y4 = st.columns(4)
+                        edit_premio = y1.number_input(
+                            "Prêmio recebido por ação", min_value=0.0, step=0.01,
+                            value=float(op["premio_recebido"]), format="%.2f", key=f"ep_{op['id']}"
+                        )
+                        edit_quantidade = y2.number_input(
+                            "Quantidade de ações", min_value=100, step=100,
+                            value=int(op["quantidade"]), key=f"eq_{op['id']}"
+                        )
+                        try:
+                            data_venc = datetime.strptime(str(op["vencimento"])[:10], "%Y-%m-%d").date()
+                        except ValueError:
+                            data_venc = date.today()
+                        edit_vencimento = y3.date_input("Vencimento", value=data_venc, key=f"ev_{op['id']}")
+                        edit_cotacao = y4.number_input(
+                            "Cotação atual manual", min_value=0.0, step=0.01,
+                            value=float(op["cotacao_atual_manual"]), format="%.2f", key=f"em_{op['id']}"
+                        )
+                        edit_obs = st.text_input(
+                            "Observação", value=str(op["observacao"]) if pd.notna(op["observacao"]) else "",
+                            key=f"eo_{op['id']}"
+                        )
+                        salvar_edicao = st.form_submit_button("💾 Salvar alterações", type="primary")
+
+                        if salvar_edicao:
+                            idx = st.session_state.operacoes.index[st.session_state.operacoes["id"] == op["id"]]
+                            if len(idx):
+                                i = idx[0]
+                                st.session_state.operacoes.loc[i, [
+                                    "ativo_base", "codigo", "tipo", "strike", "premio_recebido",
+                                    "quantidade", "vencimento", "cotacao_atual_manual", "observacao"
+                                ]] = [
+                                    edit_ativo, edit_codigo, edit_tipo, edit_strike, edit_premio,
+                                    int(edit_quantidade), edit_vencimento.isoformat(), edit_cotacao, edit_obs
+                                ]
+                                salvar_operacoes(st.session_state.operacoes)
+                                st.success("Operação atualizada.")
+                                st.rerun()
+
+                    confirmar = st.checkbox(
+                        "Confirmo que desejo excluir permanentemente esta operação",
+                        key=f"conf_del_{op['id']}"
+                    )
+                    if st.button("🗑️ Excluir operação", key=f"del_{op['id']}", disabled=not confirmar):
+                        st.session_state.operacoes = st.session_state.operacoes[
+                            st.session_state.operacoes["id"] != op["id"]
+                        ].reset_index(drop=True)
+                        salvar_operacoes(st.session_state.operacoes)
+                        st.success("Operação excluída.")
+                        st.rerun()
+
+        st.divider()
+        st.subheader("Tabela consolidada")
+        tabela = operacoes_calc[[
+            "ativo_base", "codigo", "tipo", "strike", "premio_recebido", "quantidade",
+            "cotacao_atual", "valor_recebido", "resultado_atual", "premio_capturado_pct",
+            "capital_referencia", "rentabilidade_atual_pct", "rentabilidade_maxima_pct",
+            "dias_restantes", "sinal"
+        ]].copy()
+        st.dataframe(tabela, use_container_width=True, hide_index=True)
+
+        csv = tabela.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "⬇️ Exportar acompanhamento em CSV", csv,
+            file_name="acompanhamento_operacoes.csv", mime="text/csv"
+        )
+
+    encerradas = st.session_state.operacoes[st.session_state.operacoes["status"] == "ENCERRADA"]
+    if not encerradas.empty:
+        with st.expander(f"Histórico de encerradas ({len(encerradas)})"):
+            st.dataframe(encerradas, use_container_width=True, hide_index=True)
